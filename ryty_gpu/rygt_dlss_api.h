@@ -27,6 +27,17 @@ typedef struct RygtDlssImage {
     uint32_t height;
 } RygtDlssImage;
 
+// Optional stereo frame-generation entry point. Older plugins support the original API.
+typedef struct RygtDlssEyeFrame {
+    RygtDlssImage color, depth, motion, output;
+    float position[3], orientation[4], tangents[4]; // OpenXR seat space, left/right/up/down
+    unsigned int eye, reset;
+} RygtDlssEyeFrame;
+typedef int(VKAPI_PTR* PFN_RygtDlss_GenerateEye)(VkCommandBuffer cmd, const RygtDlssEyeFrame* frame);
+// Optional extensions. Older plugins continue to provide one midpoint per source pair.
+typedef unsigned(VKAPI_PTR* PFN_RygtDlss_MaxGeneratedFrames)(void);
+typedef int(VKAPI_PTR* PFN_RygtDlss_GenerateEyeIndexed)(VkCommandBuffer cmd, const RygtDlssEyeFrame* frame, unsigned count, unsigned index);
+
 // Returns RYGT_DLSS_API_VERSION.
 typedef int(VKAPI_PTR* PFN_RygtDlss_ApiVersion)(void);
 
