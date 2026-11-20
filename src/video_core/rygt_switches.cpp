@@ -38,6 +38,7 @@ RYGT_SWITCH_EXPORT extern const std::size_t RyGT_SwitchDescriptionCount;
 RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Shader objects & caches
 #ifdef RYGT_OPENXR
+    "RYGTSW1|SHADGT_OPENXR_TAA|choice|Rendering workarounds|balanced|game; balanced; clear|Adjusts GT7 stereo anti-aliasing when the view is still. Clear preserves more fine detail and can increase shimmer. Game uses the original blend.",
     "RYGTSW1|SHADGT_OPENXR_OUTPUT_PERCENT|int|Frame pacing & present|100|25-100 = percent per axis|Sets the OpenXR eye swapchain size as a percentage of the headset runtime recommendation.",
     "RYGTSW1|SHADGT_OPENXR_RENDER_PERCENT|int|Frame pacing & present|0|0 = game default, 25-100 = percent per axis|Legacy input size for launches without VR output percentage or VR quality settings.",
     "RYGTSW1|SHARED_OPENXR|flag|Frame pacing & present|off|1 = on, 0 = off|Presents SDR game output on a seated OpenXR screen. A projection layer requires two game-rendered eye views.",
