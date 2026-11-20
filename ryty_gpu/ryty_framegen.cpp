@@ -26,6 +26,11 @@
 #include "ryty_gpu/ffx_api/ffx_framegeneration.h"
 #include "ryty_gpu/ffx_api/vk/ffx_api_vk.h"
 
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ffx_api/ffx_upscale.h"
+#include "ryty_gpu/ryty_openxr_effects.h"
+#endif
+
 namespace Vulkan::RytyFrameGen {
 
 namespace {
@@ -796,3 +801,136 @@ void FrameGen::CreateAuxImages(vk::CommandBuffer cmdbuf, vk::Extent2D size) {
 }
 
 } // namespace Vulkan::RytyFrameGen
+#ifdef RYGT_OPENXR
+namespace Vulkan::XrVendor {
+using namespace RytyFrameGen;
+
+void DestroyFidelity(void*& ctx) {
+    if (ctx)
+        g_api.destroy_context(&ctx, nullptr);
+    ctx = nullptr;
+}
+
+// FEAT-SGT-100: isolate FidelityFX reconstruction and interpolation contexts per eye.
+bool Fidelity(vk::PhysicalDevice gpu, vk::Device device, vk::CommandBuffer cmd, void*& ctx,
+              const XrEffectFrame& f, bool generate) {
+    if (!Load())
+        return false;
+    const auto render = FfxApiDimensions2D{f.depth.size.width, f.depth.size.height};
+    const auto& destination = generate ? f.generated : f.scaled;
+    const auto display = FfxApiDimensions2D{destination.size.width, destination.size.height};
+    const FfxApiRect2D rect{0, 0, int(display.width), int(display.height)};
+    const auto checked = [](ffxReturnCode_t r, const char* operation) {
+        if (r != FFX_API_RETURN_OK)
+            LOG_WARNING(Render_Vulkan, "OpenXR FidelityFX {} failed ({})", operation, r);
+        return r == FFX_API_RETURN_OK;
+    };
+    if (!ctx) {
+        ffxCreateBackendVKDesc backend{};
+        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+        backend.vkDevice = device;
+        backend.vkPhysicalDevice = gpu;
+        backend.vkDeviceProcAddr = RytyFsr3::DeviceProcAddrShim();
+        if (generate) {
+            ffxCreateContextDescFrameGeneration d{};
+            d.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, &backend.header};
+            d.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
+            d.displaySize = display;
+            d.maxRenderSize = render;
+            d.backBufferFormat = ffxApiGetSurfaceFormatVK(VkFormat(f.color.format));
+            if (!checked(g_api.create_context(&ctx, &d.header, nullptr), "create interpolation"))
+                return false;
+        } else {
+            ffxCreateContextDescUpscale d{};
+            d.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &backend.header};
+            d.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
+                      FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+            d.maxRenderSize = render;
+            d.maxUpscaleSize = display;
+            d.fpMessage = OnMessage;
+            if (!checked(g_api.create_context(&ctx, &d.header, nullptr), "create upscaler"))
+                return false;
+        }
+    }
+    const auto read = [](const XrEffectImage& i) {
+        return Resource(i.image, i.format, i.size, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    };
+    const auto out = Resource(destination.image, destination.format, destination.size,
+                              FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!generate) {
+        ffxDispatchDescUpscale d{};
+        d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        d.commandList = VkCommandBuffer(cmd);
+        d.color = read(f.color);
+        d.depth = read(f.depth);
+        d.motionVectors = read(f.motion);
+        d.output = out;
+        d.renderSize = render;
+        d.upscaleSize = display;
+        d.motionVectorScale = {float(render.width), float(render.height)};
+        d.frameTimeDelta = f.dt_ms;
+        d.preExposure = d.viewSpaceToMetersFactor = 1.f;
+        d.reset = f.reset;
+        // The Vulkan provider expects the clipping endpoints in depth-buffer order.
+        d.cameraNear = 1000.f;
+        d.cameraFar = 0.1f;
+        d.cameraFovAngleVertical = f.vertical_fov;
+        d.jitterOffset = {f.jitter_pixels[0], f.jitter_pixels[1]};
+        return checked(g_api.dispatch(&ctx, &d.header), "upscale");
+    }
+    ffxConfigureDescFrameGeneration config{};
+    config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    config.frameGenerationEnabled = true;
+    config.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    config.generationRect = rect;
+    config.frameID = f.sequence;
+    if (!checked(g_api.configure(&ctx, &config.header), "configure interpolation"))
+        return false;
+    ffxDispatchDescFrameGenerationPrepare prep{};
+    prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+    ffxDispatchDescFrameGenerationPrepareCameraInfo camera{};
+    camera.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+    const auto& q = f.pose.orientation;
+    const auto& pos = f.pose.position;
+    auto set = [](float(&v)[3], float x, float y, float z) {
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
+    };
+    set(camera.cameraPosition, pos.x, pos.y, pos.z);
+    set(camera.cameraRight, 1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y + q.w * q.z),
+        2 * (q.x * q.z - q.w * q.y));
+    set(camera.cameraUp, 2 * (q.x * q.y - q.w * q.z), 1 - 2 * (q.x * q.x + q.z * q.z),
+        2 * (q.y * q.z + q.w * q.x));
+    set(camera.cameraForward, -2 * (q.x * q.z + q.w * q.y), -2 * (q.y * q.z - q.w * q.x),
+        2 * (q.x * q.x + q.y * q.y) - 1);
+    prep.header.pNext = &camera.header;
+    prep.frameID = f.sequence;
+    prep.commandList = VkCommandBuffer(cmd);
+    prep.renderSize = render;
+    prep.motionVectorScale = {float(render.width), float(render.height)};
+    prep.viewSpaceToMetersFactor = 1.f;
+    prep.frameTimeDelta = f.dt_ms;
+    prep.cameraNear = 1000.f;
+    prep.cameraFar = 0.1f;
+    prep.cameraFovAngleVertical = f.vertical_fov;
+    prep.depth = read(f.depth);
+    prep.motionVectors = read(f.motion);
+    if (!checked(g_api.dispatch(&ctx, &prep.header), "prepare interpolation"))
+        return false;
+    ffxDispatchDescFrameGeneration d{};
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+    d.commandList = VkCommandBuffer(cmd);
+    d.presentColor = read(f.color);
+    d.outputs[0] = out;
+    d.numGeneratedFrames = 1;
+    d.reset = f.reset;
+    d.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    d.minMaxLuminance[1] = 100.f;
+    d.generationRect = rect;
+    d.frameID = f.sequence;
+    return checked(g_api.dispatch(&ctx, &d.header), "interpolate");
+}
+} // namespace Vulkan::XrVendor
+#endif
