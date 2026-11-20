@@ -24,6 +24,9 @@
 #endif
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_camera.h"
+#endif
 #ifdef RYTY_GPU
 #include "common/ryty_param_sfo.h"
 #include "core/file_format/psf.h"
@@ -430,11 +433,15 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     // DIAG-GT7-007: the game asks for a flip at the end of the command buffers it submits next.
     RyDiag::Timeline('E', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0, buf_id);
 
+    std::shared_ptr<const Vulkan::GameStereoFrame> xr_frame;
+#ifdef RYGT_OPENXR
+    xr_frame = Vulkan::Gt7XrCamera::Claim(buf_id);
+#endif
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
             ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
-            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true, anti_lag_frame);
+            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true, anti_lag_frame, xr_frame);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
     driver->NoteEopFlipRequested(); // PERF-111
