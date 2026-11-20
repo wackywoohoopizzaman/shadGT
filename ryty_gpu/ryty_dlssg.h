@@ -61,6 +61,13 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Format output_format, vk::Extent2D output_size,
              const RytyUpscale::TemporalInputs* temporal = nullptr);
 
+#ifdef RYGT_OPENXR
+enum class XrMarker { CameraReady, RenderEnd, PresentStart, PresentEnd };
+bool XrReflexRequested();
+u32 BeginXrReflexFrame();
+void MarkXrFrame(u32 token, XrMarker marker);
+#endif
+
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();
 void PresentEnd();

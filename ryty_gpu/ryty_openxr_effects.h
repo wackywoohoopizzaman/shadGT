@@ -21,5 +21,8 @@ namespace XrVendor {
 bool Fidelity(vk::PhysicalDevice gpu, vk::Device device, vk::CommandBuffer cmd, void*& context,
               const XrEffectFrame& frame, bool generate);
 void DestroyFidelity(void*& context);
+bool GenerateDlss(vk::CommandBuffer cmd, const XrEffectFrame& frame, unsigned eye, const XrView&,
+                  unsigned count, unsigned index);
+bool Dlss(vk::CommandBuffer cmd, const XrEffectFrame& frame, unsigned eye);
 } // namespace XrVendor
 } // namespace Vulkan

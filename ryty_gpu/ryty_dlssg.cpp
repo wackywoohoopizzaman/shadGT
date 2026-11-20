@@ -4,6 +4,8 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <magic_enum/magic_enum.hpp>
+
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -19,6 +21,9 @@
 #include "ryty_gpu/ryty_framegen.h"
 #include "ryty_gpu/ryty_dlssg_options.h"
 #include "ryty_gpu/ryty_dlssg_state.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr.h"
+#endif
 #include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/host_shaders/dlss_motion_comp.h"
@@ -810,6 +815,121 @@ const char* SuspensionName(Suspension reason) {
 
 } // namespace
 
+#ifdef RYGT_OPENXR
+namespace {
+sl::ReflexMode XrReflexMode() {
+    static const auto mode = [] {
+        const char* xr = std::getenv("SHARED_OPENXR");
+        const char* value = std::getenv("SHADGT_OPENXR_REFLEX");
+        const char* fg = std::getenv("SHARED_OPENXR_FRAMEGEN");
+        const std::string_view setting = value ? value : "auto";
+        if (xr && std::string_view{xr} == "1") {
+            if (setting == "boost")
+                return sl::ReflexMode::eLowLatencyWithBoost;
+            if (setting == "on" || (setting == "auto" && fg && std::string_view{fg} == "dlss"))
+                return sl::ReflexMode::eLowLatency;
+        }
+        return sl::ReflexMode::eOff;
+    }();
+    return mode;
+}
+struct XrReflex {
+    PFun_slReflexSleep* sleep{};
+    PFun_slPCLSetMarker* marker{};
+    struct Frame {
+        sl::FrameToken* token{};
+        unsigned next_marker{};
+    };
+    std::array<Frame, 16> frames{};
+    bool initialized{}, active{};
+} xr_reflex;
+} // namespace
+
+bool XrReflexRequested() { return XrReflexMode() != sl::ReflexMode::eOff; }
+
+u32 BeginXrReflexFrame() {
+    const auto mode = XrReflexMode();
+    if (mode == sl::ReflexMode::eOff || !Active())
+        return 0;
+    std::unique_lock lock{g_sl.mutex};
+    auto& xr = xr_reflex;
+    if (!xr.initialized) {
+        xr.initialized = true;
+        auto state_fn = Feature<PFun_slReflexGetState>(sl::kFeatureReflex, "slReflexGetState");
+        auto options_fn =
+            Feature<PFun_slReflexSetOptions>(sl::kFeatureReflex, "slReflexSetOptions");
+        xr.sleep = Feature<PFun_slReflexSleep>(sl::kFeatureReflex, "slReflexSleep");
+        xr.marker = Feature<PFun_slPCLSetMarker>(sl::kFeaturePCL, "slPCLSetMarker");
+        sl::ReflexState state{};
+        sl::ReflexOptions options{};
+        options.mode = mode;
+        xr.active = state_fn && options_fn && xr.sleep && xr.marker &&
+                    state_fn(state) == sl::Result::eOk && state.lowLatencyAvailable &&
+                    options_fn(options) == sl::Result::eOk;
+        LOG_WARNING(Render_Vulkan,
+                    "OpenXR: NVIDIA Reflex {} (requested {}, driver low latency available {})",
+                    xr.active ? "active" : "unavailable",
+                    mode == sl::ReflexMode::eLowLatencyWithBoost ? "On + Boost" : "On",
+                    state.lowLatencyAvailable);
+    }
+    if (!xr.active)
+        return 0;
+    sl::FrameToken* token{};
+    ++g_sl.frame_index;
+    if (g_sl.new_frame_token(token, &g_sl.frame_index) != sl::Result::eOk || !token)
+        return 0;
+    // Other threads can finish the preceding frame while the driver paces this producer.
+    const u32 id = *token;
+    lock.unlock();
+    const auto slept = xr.sleep(*token);
+    lock.lock();
+    if (!xr.active || u32(*token) != id)
+        return 0;
+    if (slept != sl::Result::eOk ||
+        xr.marker(sl::PCLMarker::eSimulationStart, *token) != sl::Result::eOk) {
+        LOG_WARNING(Render_Vulkan,
+                    "OpenXR: Reflex sleep or frame marker failed; continuing with OpenXR pacing");
+        xr.active = false;
+        return 0;
+    }
+    xr.frames[id % xr.frames.size()] = {token, 0};
+    return id;
+}
+
+void MarkXrFrame(u32 id, XrMarker point) {
+    if (!id)
+        return;
+    std::scoped_lock lock{g_sl.mutex};
+    auto& xr = xr_reflex;
+    auto& frame = xr.frames[id % xr.frames.size()];
+    auto* token = frame.token;
+    if (!xr.active || !token || u32(*token) != id || unsigned(point) != frame.next_marker)
+        return;
+    ++frame.next_marker;
+    sl::PCLMarker marker{};
+    switch (point) {
+    case XrMarker::CameraReady:
+        if (xr.marker(sl::PCLMarker::eSimulationEnd, *token) != sl::Result::eOk)
+            return;
+        marker = sl::PCLMarker::eRenderSubmitStart;
+        break;
+    case XrMarker::RenderEnd:
+        marker = sl::PCLMarker::eRenderSubmitEnd;
+        break;
+    case XrMarker::PresentStart:
+        marker = sl::PCLMarker::ePresentStart;
+        break;
+    case XrMarker::PresentEnd:
+        marker = sl::PCLMarker::ePresentEnd;
+        break;
+    }
+    if (xr.marker(marker, *token) != sl::Result::eOk) {
+        LOG_WARNING(Render_Vulkan, "OpenXR: Reflex frame marker {} failed", int(point));
+        xr.active = false;
+    }
+}
+#endif
+
 bool Requested() {
     return EmulatorSettings.IsDlssgEnabled();
 }
@@ -819,7 +939,13 @@ bool Active() {
 }
 
 bool UpscaleRequested() {
-    if (!EmulatorSettings.IsDlssEnabled()) {
+    bool requested = EmulatorSettings.IsDlssEnabled();
+#ifdef RYGT_OPENXR
+    const char* vr = std::getenv("SHARED_OPENXR");
+    const char* mode = std::getenv("SHADGT_OPENXR_UPSCALER");
+    requested |= vr && std::string_view{vr} == "1" && mode && std::string_view{mode} == "dlss";
+#endif
+    if (!requested) {
         return false;
     }
     // SHADGT_DLSS_STREAMLINE=0 keeps upscaling on the self-built ryGT_dlss.dll plugin.
@@ -848,7 +974,11 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     }
     g_sl.tried = true;
     g_sl.upscale_requested = UpscaleRequested();
-    if (!Requested() && !g_sl.upscale_requested) {
+    bool xr_reflex_requested = false;
+#ifdef RYGT_OPENXR
+    xr_reflex_requested = XrReflexRequested();
+#endif
+    if (!Requested() && !g_sl.upscale_requested && !xr_reflex_requested) {
         return nullptr;
     }
     const std::wstring dir = DlssDir();
@@ -888,6 +1018,8 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
         features.insert(features.end(),
                         {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL});
     }
+    if (xr_reflex_requested && !Requested())
+        features.insert(features.end(), {sl::kFeatureReflex, sl::kFeaturePCL});
     if (g_sl.upscale_requested) {
         features.push_back(sl::kFeatureDLSS);
     }
@@ -920,14 +1052,19 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     }
     g_sl.module = module;
     g_sl.get_instance_proc_addr = gipa;
-    LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: Streamline started ({}{}); Vulkan goes through it",
-                Requested() ? "frame generation" : "",
-                g_sl.upscale_requested ? (Requested() ? ", upscaling" : "upscaling") : "");
+    LOG_WARNING(Render_Vulkan,
+                "ryGT: Streamline started for Vulkan (desktop FG {}, upscaling {}, VR Reflex {})",
+                Requested(), g_sl.upscale_requested, xr_reflex_requested);
     return gipa;
 }
 
 void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Extent2D size, const RytyFrameGen::SceneInputs* scene) {
+#ifdef RYGT_OPENXR
+    // The desktop generator would also replace the headset's Reflex options.
+    if (OpenXrOutput::IsRunning())
+        return;
+#endif
     if (!Active() || !Requested()) {
         return;
     }
@@ -1136,8 +1273,8 @@ bool InitUpscale() {
 namespace {
 
 // The DLSS mode for the launcher's Upscaling quality (eOff for Auto).
-sl::DLSSMode PreferredMode() {
-    switch (RytyUpscale::GetQuality()) {
+sl::DLSSMode PreferredMode(RytyUpscale::Quality quality) {
+    switch (quality) {
     case RytyUpscale::Quality::Native:
         return sl::DLSSMode::eDLAA;
     case RytyUpscale::Quality::Quality:
@@ -1153,9 +1290,48 @@ sl::DLSSMode PreferredMode() {
     }
 }
 
+void SetDlssModel(sl::DLSSOptions& options, sl::DLSSPreset preset) {
+    options.dlaaPreset = preset;
+    options.qualityPreset = preset;
+    options.balancedPreset = preset;
+    options.performancePreset = preset;
+    options.ultraPerformancePreset = preset;
+    options.ultraQualityPreset = preset;
+}
+
+#ifdef RYGT_OPENXR
+struct VrDlssModel {
+    const char* name;
+    sl::DLSSPreset preset;
+};
+
+const VrDlssModel& SelectedVrDlssModel() {
+    static constexpr VrDlssModel models[] = {
+        {"M", sl::DLSSPreset::ePresetM},    {"L", sl::DLSSPreset::ePresetL},
+        {"K", sl::DLSSPreset::ePresetK},    {"J", sl::DLSSPreset::ePresetJ},
+        {"auto", sl::DLSSPreset::eDefault},
+    };
+    static const VrDlssModel& selected = []() -> const VrDlssModel& {
+        const char* value = std::getenv("SHADGT_OPENXR_DLSS_MODEL");
+        if (value && *value) {
+            for (const auto& model : models) {
+                if (_stricmp(value, model.name) == 0) {
+                    return model;
+                }
+            }
+            LOG_WARNING(Render_Vulkan, "OpenXR: unknown DLSS model '{}', using M", value);
+        }
+        return models[0];
+    }();
+    return selected;
+}
+#endif
+
 // The DLSS quality mode whose render size range holds input for output, or -1: the chosen
 // quality's mode when it fits, else the first that does.
-int FindMode(vk::Extent2D input, vk::Extent2D output) {
+int FindMode(vk::Extent2D input, vk::Extent2D output,
+             sl::DLSSPreset preset = sl::DLSSPreset::eDefault,
+             RytyUpscale::Quality quality = RytyUpscale::GetQuality()) {
     if (input.width > output.width || input.height > output.height) {
         return -1;
     }
@@ -1165,7 +1341,7 @@ int FindMode(vk::Extent2D input, vk::Extent2D output) {
         sl::DLSSMode::eMaxPerformance, sl::DLSSMode::eUltraPerformance,
     };
     std::vector<sl::DLSSMode> modes;
-    if (const sl::DLSSMode preferred = PreferredMode(); preferred != sl::DLSSMode::eOff) {
+    if (const sl::DLSSMode preferred = PreferredMode(quality); preferred != sl::DLSSMode::eOff) {
         modes.push_back(preferred);
     }
     modes.insert(modes.end(), std::begin(all), std::end(all));
@@ -1174,6 +1350,7 @@ int FindMode(vk::Extent2D input, vk::Extent2D output) {
         options.mode = mode;
         options.outputWidth = output.width;
         options.outputHeight = output.height;
+        SetDlssModel(options, preset);
         sl::DLSSOptimalSettings settings{};
         if (g_sl.dlss_get_optimal(options, settings) != sl::Result::eOk) {
             continue;
@@ -1425,3 +1602,90 @@ void Shutdown() {
 }
 
 } // namespace Vulkan::RytyDlssG
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_effects.h"
+namespace Vulkan::XrVendor {
+// FEAT-SGT-080: each eye has its own Streamline viewport and temporal history.
+bool Dlss(vk::CommandBuffer cmd, const XrEffectFrame& f, unsigned eye) {
+    using namespace RytyDlssG;
+    if (!InitUpscale())
+        return false;
+    std::scoped_lock lock{g_sl.mutex};
+    const sl::ViewportHandle viewport{2u + eye};
+    static sl::FrameToken* token{};
+    static uint64_t token_sequence{};
+    if (eye == 0) {
+        ++g_sl.frame_index;
+        token = nullptr;
+        if (g_sl.new_frame_token(token, &g_sl.frame_index) != sl::Result::eOk)
+            return false;
+        token_sequence = f.sequence;
+    }
+    if (!token || token_sequence != f.sequence)
+        return false;
+    const auto size = f.color.size, out = f.scaled.size;
+    static std::array<vk::Extent2D, 2> last_in{}, last_out{};
+    const auto& model = SelectedVrDlssModel();
+    const bool resized = size != last_in[eye] || out != last_out[eye];
+    int mode = -1;
+    if (f.reset || resized) {
+        mode = FindMode(size, out, model.preset, RytyUpscale::VrQuality());
+        if (mode < 0)
+            return false;
+        sl::DLSSOptions options{};
+        options.mode = static_cast<sl::DLSSMode>(mode);
+        options.outputWidth = out.width;
+        options.outputHeight = out.height;
+        SetDlssModel(options, model.preset);
+        options.colorBuffersHDR = sl::Boolean::eTrue;
+        options.useAutoExposure = sl::Boolean::eTrue;
+        const auto result = g_sl.dlss_set_options(viewport, options);
+        if (result != sl::Result::eOk) {
+            LOG_ERROR(Render_Vulkan,
+                      "OpenXR: DLSS rejected model {} options for eye {} (result {})", model.name,
+                      eye, static_cast<int>(result));
+            return false;
+        }
+    }
+    auto c = FlatConstants(size, f.reset);
+    c.jitterOffset = {f.jitter_pixels[0], f.jitter_pixels[1]};
+    c.depthInverted = sl::Boolean::eTrue;
+    c.cameraFOV = f.vertical_fov;
+    c.mvecScale = sl::float2(1, 1);
+    c.motionVectorsJittered = sl::Boolean::eFalse;
+    c.motionVectorsDilated = sl::Boolean::eFalse;
+    if (g_sl.set_constants(c, *token, viewport) != sl::Result::eOk)
+        return false;
+    const auto tex = [](const XrEffectImage& i, bool output = false) {
+        return Texture(i.image, i.view,
+                       output ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+                       i.size, i.format,
+                       vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
+    };
+    auto color = tex(f.color), depth = tex(f.depth), motion = tex(f.motion),
+         result = tex(f.scaled, true);
+    const sl::Extent src{0, 0, size.width, size.height}, dst{0, 0, out.width, out.height};
+    constexpr auto life = sl::ResourceLifecycle::eValidUntilEvaluate;
+    const sl::ResourceTag tags[] = {{&color, sl::kBufferTypeScalingInputColor, life, &src},
+                                    {&depth, sl::kBufferTypeDepth, life, &src},
+                                    {&motion, sl::kBufferTypeMotionVectors, life, &src},
+                                    {&result, sl::kBufferTypeScalingOutputColor, life, &dst}};
+    auto* buffer = reinterpret_cast<sl::CommandBuffer*>(VkCommandBuffer(cmd));
+    if (g_sl.set_tag(*token, viewport, tags, uint32_t(std::size(tags)), buffer) != sl::Result::eOk)
+        return false;
+    const sl::BaseStructure* args[] = {&viewport};
+    if (g_sl.evaluate(sl::kFeatureDLSS, *token, args, 1, buffer) != sl::Result::eOk)
+        return false;
+    if (resized) {
+        LOG_WARNING(Render_Vulkan,
+                    "OpenXR: DLSS eye {} evaluated with requested model {}, "
+                    "quality mode {}, {}x{} to {}x{}",
+                    eye, model.name, magic_enum::enum_name(static_cast<sl::DLSSMode>(mode)),
+                    size.width, size.height, out.width, out.height);
+        last_in[eye] = size;
+        last_out[eye] = out;
+    }
+    return true;
+}
+} // namespace Vulkan::XrVendor
+#endif
