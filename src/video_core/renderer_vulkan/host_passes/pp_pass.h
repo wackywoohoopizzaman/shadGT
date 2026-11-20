@@ -50,6 +50,8 @@ public:
         u32 hud = 0;
         float hud_x0 = 0.0f;
         float hud_x1 = 1.0f;
+        float uv_offset[2]{};
+        float uv_scale[2]{1.f, 1.f};
     };
 
     /// FIX-GT7-145: the format of a frame shown on an HDR10 output, the swapchain's own 10 bits.
@@ -66,7 +68,10 @@ public:
                 Frame& output, Settings settings, vk::ImageView ui_layer = {},
                 bool dlss_scaled = false, float side_x0 = 0.0f, float side_x1 = 1.0f,
                 vk::ImageView hud_black = {}, vk::ImageView hud_white = {},
-                std::span<const HudWidget> hud_widgets = {});
+                std::span<const HudWidget> hud_widgets = {},
+
+                vk::ImageLayout input_layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::Rect2D viewport = {}, vk::Rect2D render_area = {});
 
 private:
     struct OutputPipeline {

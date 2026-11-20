@@ -53,11 +53,24 @@ public:
             motion_scale{};        // each eye's velocity scale and jitter in motion units
         vk::Extent2D color_size{}; // frame generation consumes the final composited color
     };
+    struct MirrorImage {
+        vk::ImageView view;
+        vk::ImageLayout layout;
+        bool encoded;
+        int packed_eye;    // -1 for a separate image, otherwise the half of the game display.
+        const XrFovf* fov; // Seated movies use their entire source.
+        unsigned eye;
+    };
+    using MirrorDraw = std::function<void(vk::CommandBuffer, const MirrorImage&)>;
+    enum class DesktopMirror { Left, Right, Both, Off };
+    DesktopMirror MirrorMode() const;
+    bool MirrorsEye(unsigned eye, bool movie) const;
     // Called before camera-dependent work and paired with Present on the XR frame
     // owner. Repeated queries before the flip return the same predicted views.
     std::optional<ViewFrame> BeginFrame();
     void Present(Scheduler& scheduler, const Frame& frame, const StereoImages* stereo = nullptr,
-                 const GameStereoFrame* game = nullptr, vk::Extent2D game_eye_size = {});
+                 const GameStereoFrame* game = nullptr, vk::Extent2D game_eye_size = {},
+                 const MirrorDraw& mirror = {});
 
 private:
     inline static std::atomic<unsigned> bound_sessions{}, active_sessions{};

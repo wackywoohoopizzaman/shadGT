@@ -40,6 +40,8 @@ layout (push_constant) uniform settings {
     uint hud;
     float hud_x0;
     float hud_x1;
+    vec2 uv_offset;
+    vec2 uv_scale;
     float dlss_sharpening;
     // ryGT WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
     float side_x0;
@@ -128,7 +130,7 @@ bool inside(vec2 p, vec4 rect) {
 }
 
 void main() {
-    vec4 color_linear = texture(texSampler, uv);
+    vec4 color_linear = texture(texSampler, pp.uv_offset + uv * pp.uv_scale);
     if (pp.dlss_sharpening > 0.0) {
         ivec2 pixel = clamp(ivec2(uv * textureSize(texSampler, 0)), ivec2(0),
                             textureSize(texSampler, 0) - 1);

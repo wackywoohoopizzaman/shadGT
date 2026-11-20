@@ -950,6 +950,9 @@ Frame* Presenter::PrepareLastFrame() {
                    "Device lost during waiting for a frame");
     }
 
+    // A suppressed desktop frame was never sampled by the window.
+    if (frame->suppress_desktop) return frame;
+
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1010,6 +1013,131 @@ static bool IsHeadsetMirror(const Frame& frame) {
     return false;
 #endif
 }
+
+#ifdef RYGT_OPENXR
+namespace {
+// FEAT-SGT-078: frame the finished projection in the desktop window.
+enum class MirrorFraming { FullEye, FillWindow, Inset };
+
+MirrorFraming DesktopMirrorFraming() {
+    static const auto mode = [] {
+        const char* value = std::getenv("SHADGT_OPENXR_MIRROR_FRAMING");
+        const std::string_view key = value ? value : "";
+        if (key == "fill") return MirrorFraming::FillWindow;
+        if (key == "inset") return MirrorFraming::Inset;
+        return MirrorFraming::FullEye;
+    }();
+    return mode;
+}
+
+vk::Rect2D FrameMirror(HostPasses::PostProcessingPass::Settings& dst, const XrFovf& fov,
+                       vk::Extent2D target, int packed_eye) {
+    const float left = -std::tan(fov.angleLeft), right = std::tan(fov.angleRight);
+    const float up = std::tan(fov.angleUp), down = -std::tan(fov.angleDown);
+    const float width = left + right, height = up + down;
+    const float aspect = float(target.width) / float(target.height);
+    vk::Rect2D viewport{{0, 0}, target};
+    if (width > 0 && height > 0) {
+        const float eye_aspect = width / height;
+        switch (DesktopMirrorFraming()) {
+        case MirrorFraming::FullEye:
+            // Keep all four edges of the submitted eye, including its asymmetric periphery.
+            viewport.extent.width = std::clamp(std::lround(target.height * eye_aspect), 1L, long(target.width));
+            viewport.extent.height = std::clamp(std::lround(target.width / eye_aspect), 1L, long(target.height));
+            viewport.offset.x = (target.width - viewport.extent.width) / 2;
+            viewport.offset.y = (target.height - viewport.extent.height) / 2;
+            break;
+        case MirrorFraming::FillWindow:
+            // Crop only the axis required by the window. Preserve the optical centre when possible.
+            dst.uv_scale[0] = std::min(1.f, aspect / eye_aspect);
+            dst.uv_scale[1] = std::min(1.f, eye_aspect / aspect);
+            dst.uv_offset[0] = std::clamp(left / width - dst.uv_scale[0] / 2, 0.f, 1.f - dst.uv_scale[0]);
+            dst.uv_offset[1] = std::clamp(up / height - dst.uv_scale[1] / 2, 0.f, 1.f - dst.uv_scale[1]);
+            break;
+        case MirrorFraming::Inset: {
+            const float rx = std::min(left, right), ry = std::min(up, down);
+            if (rx <= 0 || ry <= 0) break;
+            const float half_y = 0.97f / std::hypot(aspect / rx, 1.f / ry);
+            const float half_x = half_y * aspect;
+            dst.uv_scale[0] = 2.f * half_x / width;
+            dst.uv_scale[1] = 2.f * half_y / height;
+            dst.uv_offset[0] = (left - half_x) / width;
+            dst.uv_offset[1] = (up - half_y) / height;
+            break;
+        }
+        }
+    }
+    if (packed_eye >= 0) {
+        dst.uv_scale[0] *= 0.5f;
+        dst.uv_offset[0] = (static_cast<float>(packed_eye) + dst.uv_offset[0]) * 0.5f;
+    }
+    return viewport;
+}
+
+void PresentWithMirror(OpenXrOutput& headset, Scheduler& scheduler, Frame& frame,
+                       HostPasses::PostProcessingPass& pass, HostPasses::PostProcessingPass::Settings settings,
+                       vk::ImageView game_view, vk::ImageLayout game_layout, const GameStereoFrame* game,
+                       const OpenXrOutput::StereoImages* eyes = nullptr, vk::Extent2D eye_size = {},
+                       bool native_pair = false) {
+    bool drawn = false;
+    const auto draw = [&](vk::CommandBuffer cmd, const OpenXrOutput::MirrorImage& source) {
+        const vk::ImageMemoryBarrier2 target{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = frame.image, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+        const vk::MemoryBarrier2 readable{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &readable,
+                              .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &target});
+        auto eye_settings = settings;
+        if (source.view) eye_settings.srgb_input = source.encoded;
+        vk::Rect2D area{{0, 0}, {frame.width, frame.height}};
+        if (source.fov && headset.MirrorMode() == OpenXrOutput::DesktopMirror::Both && frame.width >= 2) {
+            const auto split = frame.width / 2;
+            area.offset.x = source.eye ? int(split) : 0;
+            area.extent.width = source.eye ? frame.width - split : split;
+        }
+        auto viewport = area;
+        if (source.fov) {
+            viewport = FrameMirror(eye_settings, *source.fov, area.extent, source.packed_eye);
+            viewport.offset.x += area.offset.x;
+        }
+        pass.Render(cmd, source.view ? source.view : game_view, {}, frame, eye_settings, {}, false, 0.0f, 1.0f, {}, {}, {},
+                    source.view ? source.layout : game_layout, viewport, area);
+        drawn = true;
+    };
+    const bool off = headset.MirrorMode() == OpenXrOutput::DesktopMirror::Off;
+    if (off)
+        headset.Present(scheduler, frame, eyes, game, eye_size);
+    else
+        headset.Present(scheduler, frame, eyes, game, eye_size, std::cref(draw));
+    frame.suppress_desktop = off && OpenXrOutput::IsRunning() && !frame.is_hdr;
+    if (frame.suppress_desktop) return;
+    // A stale prediction or a runtime that skips a frame can still leave a new game eye to display.
+    if (!drawn && (native_pair || (game && !frame.is_hdr && OpenXrOutput::IsRunning()))) {
+        const bool movie = native_pair && eyes->movie;
+        for (unsigned i = 0; i < 2; ++i) {
+            // If the session just ended, recover a usable window from the left eye.
+            if (off ? i != 0 : !headset.MirrorsEye(i, movie)) continue;
+            const auto* fov = movie ? nullptr : &game->cameras.views[i].fov;
+            const OpenXrOutput::MirrorImage fallback = native_pair
+                ? OpenXrOutput::MirrorImage{eyes->colors[i], vk::ImageLayout::eGeneral, eyes->display_encoded, -1, fov, i}
+                : OpenXrOutput::MirrorImage{{}, {}, false, static_cast<int>(i), fov, i};
+            draw(scheduler.DirectCommandBuffer(), fallback);
+        }
+        SubmitInfo info{};
+        frame.ready_tick = scheduler.Flush(info);
+    }
+}
+} // namespace
+#endif
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address, const GameStereoFrame* xr_frame) {
@@ -1220,7 +1348,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     draw_scheduler.Flush(info);
 #ifdef RYGT_OPENXR
     if (auto* headset = instance.Headset()) {
-        headset->Present(draw_scheduler, *frame, nullptr, xr_frame);
+        PresentWithMirror(*headset, draw_scheduler, *frame, pp_pass, pp_settings,
+                          image_view, vk::ImageLayout::eShaderReadOnlyOptimal, xr_frame);
     }
 #endif
     return frame;
@@ -1738,11 +1867,14 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     frame->ready_tick = draw_scheduler.Flush(info);
 #ifdef RYGT_OPENXR
     if (auto* headset = instance.Headset()) {
-        const OpenXrOutput::StereoImages eyes{
-            xr_frame ? xr_frame->cameras.id : 0, display->xr_eyes, true, display->xr_movie,
-            display->xr_depth, display->xr_motion, display->xr_motion_scale, display->xr_color_size};
-        headset->Present(draw_scheduler, *frame, xr_frame ? &eyes : nullptr, xr_frame,
-                         display->xr_eye_size);
+        // Keep a complete packed frame available when the runtime rejects a stale prediction.
+        const bool native_pair = xr_frame && !frame->is_hdr && display->xr_eyes[0] &&
+                                 display->xr_eyes[1] && display->xr_eyes[0] != display->xr_eyes[1];
+        const OpenXrOutput::StereoImages eyes{xr_frame ? xr_frame->cameras.id : 0, display->xr_eyes, true, display->xr_movie,
+                                              display->xr_depth, display->xr_motion, display->xr_motion_scale, display->xr_color_size};
+        PresentWithMirror(*headset, draw_scheduler, *frame, pp_pass, pp_settings,
+                          display->view, vk::ImageLayout::eGeneral, xr_frame, xr_frame ? &eyes : nullptr,
+                          display->xr_eye_size, native_pair);
     }
 #endif
     native.NoteTemporalRead(*display, frame->ready_tick);
@@ -1849,6 +1981,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     if (auto* headset = instance.Headset()) {
         if (!present_thread)
             headset->Present(scheduler, *frame);
+        frame->suppress_desktop = headset->MirrorMode() == OpenXrOutput::DesktopMirror::Off &&
+                                  OpenXrOutput::IsRunning() && !frame->is_hdr;
     }
 #endif
     return frame;
@@ -1918,6 +2052,34 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             free_cv.notify_one();
         }
     };
+    const auto complete_frame = [&] {
+        free_frame();
+        if (!is_reusing_frame && is_game_frame) {
+            DebugState.IncFlipFrameNum();
+            Common::NoteGameFrameCadence();
+            Common::NoteGameFrame();
+            RyDiag::FrameShown();
+        }
+    };
+#ifdef RYGT_OPENXR
+    if (frame->suppress_desktop && !OpenXrOutput::IsRunning()) {
+        frame->suppress_desktop = false;
+    }
+#endif
+    const auto window_width = window.GetWidth(), window_height = window.GetHeight();
+    const bool resized = window_width != swapchain.GetWidth() || window_height != swapchain.GetHeight();
+    if (resized) desktop_blanked = false;
+    u32 capture_with_overlays_count = 0;
+    if (frame->suppress_desktop && window_width && window_height)
+        capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
+    if (frame->suppress_desktop && (!window_width || !window_height ||
+        (desktop_blanked && !capture_with_overlays_count && !FlashWatchScreen()))) {
+        // No present fence will protect this slot. Its menu or blank frame can still be on the GPU.
+        if (frame->ready_scheduler)
+            frame->ready_scheduler->GetWorkSemaphore()->Wait(frame->ready_tick);
+        complete_frame();
+        return;
+    }
 
 #ifdef RYTY_GPU
     if (swapchain.FrameGenStartDue()) {
@@ -1934,7 +2096,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     // semaphores, so it holds the submit lock, as Present's recreate does: Alt+Tab from a
     // borderless window on an RX 6600 XT made the acquire report out of date, and the recreate
     // ran while the command thread submitted ("Device lost during submit").
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+    if (resized) {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
@@ -1960,11 +2122,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
-    ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
+    ImGuiID dockId = frame->suppress_desktop ? 0 : ImGui::Core::NewFrame(is_reusing_frame);
 #ifdef RYTY_GPU
     // GTS-019: while a replay is exported to video, the screen shows only that (drawn on the
     // swapchain, after the frame copy, so the recorded game frames stay clean).
-    {
+    if (!frame->suppress_desktop) {
         int seconds = 0;
         const int state = RytyVideoExportState(&seconds);
         if (state != 0) {
@@ -2012,7 +2174,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.DirectCommandBuffer();
-    const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
+    if (!frame->suppress_desktop)
+        capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
     std::optional<ScreenshotReadback> video_readback; // GTS-015
 
@@ -2122,9 +2285,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
                                vk::PipelineStageFlagBits::eColorAttachmentOutput |
                                    vk::PipelineStageFlagBits::eFragmentShader,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+                               vk::DependencyFlagBits::eByRegion, {}, {},
+                               {frame->suppress_desktop ? 1u : 2u, pre_barriers.data()});
 
-        { // Draw the game
+        if (frame->suppress_desktop) {
+            const vk::RenderingAttachmentInfo black{
+                .imageView = swapchain_image_view, .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .loadOp = vk::AttachmentLoadOp::eClear, .storeOp = vk::AttachmentStoreOp::eStore,
+                .clearValue = vk::ClearValue{.color = vk::ClearColorValue{std::array{0.f, 0.f, 0.f, 1.f}}}};
+            cmdbuf.beginRendering({.renderArea = {{0, 0}, extent}, .layerCount = 1,
+                                   .colorAttachmentCount = 1, .pColorAttachments = &black});
+            cmdbuf.endRendering();
+        } else { // Draw the game
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f});
             ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -2183,8 +2355,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             ImGui::End();
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
+            ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
         }
-        ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
         // Not of a minimized window (a 0x0 swapchain: a 0-byte readback buffer stopped the game).
         const bool recorder_frame =
@@ -2340,6 +2512,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             trace->present_outcome = presented ? 1 : 2;
         }
 #endif
+        desktop_blanked = presented && frame->suppress_desktop;
         if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
@@ -2347,13 +2520,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     }
     steps.Report();
 
-    free_frame();
-    if (!is_reusing_frame && is_game_frame) {
-        DebugState.IncFlipFrameNum();
-        Common::NoteGameFrameCadence();
-        Common::NoteGameFrame();
-        RyDiag::FrameShown();
-    }
+    complete_frame();
 }
 
 Frame* Presenter::GetRenderFrame() {
@@ -2425,6 +2592,7 @@ Frame* Presenter::GetRenderFrame() {
     frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
     frame->framegen_scene.hudless_scene_valid = false;
 #endif
+    frame->suppress_desktop = false;
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
