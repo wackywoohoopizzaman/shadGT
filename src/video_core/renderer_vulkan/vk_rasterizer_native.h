@@ -180,6 +180,11 @@ public:
         std::optional<RytyUpscale::TemporalInputs> temporal;
         // Keep the views alive between FindDisplay and submission of the presenter's reads.
         std::array<std::shared_ptr<TemporalScratchImage>, 4> temporal_images{};
+#ifdef RYGT_OPENXR
+        std::array<vk::ImageView, 2> xr_eyes{};
+        vk::Extent2D xr_eye_size{};
+        bool xr_movie{};
+#endif
     };
     void NoteTemporalRead(const Display& display, u64 tick);
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
@@ -430,6 +435,31 @@ private:
         ViewUse use;
         vk::UniqueImageView view;
     };
+
+#ifdef RYGT_OPENXR
+    // The two final eye-copy draws must refer to the same, still-current image.
+    static constexpr u64 XrStereoTaaShader = 0x286680a7;
+    vk::DescriptorBufferInfo XrTaaConstants(VAddr address, u64 alignment);
+    struct XrEyeCopies {
+        const Native::ImageEntry* output{};
+        const Native::ImageEntry* source{};
+        VAddr source_address{};
+        u64 frame{}, source_version{}, output_version{};
+        std::array<vk::ImageView, 2> eyes{};
+    } xr_copies;
+    struct {
+        const Native::ImageEntry* target{};
+        u64 frame{}, version{};
+    } xr_movie;
+    bool IsXrResultsSurround(const GraphicsPipeline& pipeline, const Targets& targets,
+                             const AmdGpu::Regs& regs, const DrawBindings& bindings);
+    void SetXrFadeProjection(const GraphicsPipeline& pipeline, const Targets& targets,
+                             const AmdGpu::Regs& regs, DrawBindings& bindings);
+    bool BindXrMovieRightEye(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const AmdGpu::Regs& regs, const DrawBindings& bindings);
+    void NoteXrEyeCopy(const GraphicsPipeline& pipeline, const Targets& targets, const DrawBindings& bindings);
+    void GetXrEyeCopies(const Native::ImageEntry& output, Display& display);
+#endif
 
     Native::MadeImage MakeImage(const VideoCore::ImageInfo& info, bool render_target);
 
