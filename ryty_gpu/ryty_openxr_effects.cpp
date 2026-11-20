@@ -82,16 +82,18 @@ struct XrEyeEffects::Impl {
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
     vk::UniqueSampler sampler;
-    bool dlss{}, fsr{}, failed{}, sr_failed{};
+    bool dlss{}, fsr{}, fg{}, ngx_fg{}, failed{}, sr_failed{}, fg_failed{};
     uint64_t sequence{};
     bool have_history{};
     vk::Extent2D source_size{}, color_size{};
     std::array<vk::Extent2D, 2> output_sizes{};
     struct Eye {
         Image color, depth, motion, scaled;
-        void* sr_ctx{};
+        Image generated;
+        void *sr_ctx{}, *fg_ctx{};
         ~Eye() {
             XrVendor::DestroyFidelity(sr_ctx);
+            XrVendor::DestroyFidelity(fg_ctx);
         }
     };
     std::array<std::unique_ptr<Eye>, 2> eyes;
@@ -149,6 +151,8 @@ struct XrEyeEffects::Impl {
                 return false;
             if ((fsr || dlss) && !e.scaled.Make(device, gpu, output[i], rgba))
                 return false;
+            if (fg && !e.generated.Make(device, gpu, color, rgba))
+                return false;
         }
         source_size = input;
         color_size = color;
@@ -193,20 +197,25 @@ XrEyeEffects::XrEyeEffects(const Instance& instance, Stage stage) : impl(std::ma
     const char* mode = std::getenv("SHADGT_OPENXR_UPSCALER");
     impl->fsr = stage == Stage::Scene && mode && std::string_view{mode} == "fsr";
     impl->dlss = stage == Stage::Scene && mode && std::string_view{mode} == "dlss";
-
+    const char* fg = std::getenv("SHARED_OPENXR_FRAMEGEN");
+    impl->ngx_fg = fg && std::string_view{fg} == "dlss";
+    impl->fg =
+        stage == Stage::FrameGeneration && (impl->ngx_fg || (fg && std::string_view{fg} == "1"));
 }
 XrEyeEffects::~XrEyeEffects() = default;
 
+unsigned XrEyeEffects::GenerationLimit() const { return impl->fg && !impl->fg_failed ? 1u : 0u; }
 
 XrEyeEffects::Pair XrEyeEffects::Process(vk::CommandBuffer cmd,
                                          const OpenXrOutput::StereoImages& source,
                                          const OpenXrOutput::ViewFrame& cameras, vk::Extent2D input,
                                          const std::array<vk::Extent2D, 2>& output,
-                                         int64_t source_interval_ns) {
+                                         int64_t source_interval_ns, unsigned slots) {
     Pair pair{};
     auto& s = *impl;
     const bool upscale = s.fsr || s.dlss;
-    if (s.failed || !upscale || s.sr_failed || !input.width || !input.height)
+    if (s.failed || (upscale && s.sr_failed) || (!upscale && (!s.fg || s.fg_failed)) ||
+        !input.width || !input.height)
         return pair;
     for (unsigned i = 0; i < 2; ++i) {
         if (!source.colors[i] || !source.depth[i] || !source.motion[i] ||
@@ -237,7 +246,7 @@ XrEyeEffects::Pair XrEyeEffects::Process(vk::CommandBuffer cmd,
                      e.motion.desc,
                      e.depth.desc,
                      e.scaled.desc,
-                     {},
+                     e.generated.desc,
                      dt,
                      fov.angleUp - fov.angleDown,
                      reset,
@@ -276,6 +285,24 @@ XrEyeEffects::Pair XrEyeEffects::Process(vk::CommandBuffer cmd,
                                      input, output[0], detail == "reduced" ? 0.0f : -1.0f)
                                : 0.0f;
         Gt7XrCamera::dlss_material_mip_bias.store(bias, std::memory_order_relaxed);
+    }
+    if (s.fg && !s.fg_failed) {
+        // FEAT-SGT-050: produce one midpoint only after both eye histories have been seeded.
+        for (unsigned eye = 0; eye < frames.size(); ++eye) {
+            auto& frame = frames[eye];
+            Transition(cmd, frame.generated.image, vk::ImageLayout::eUndefined, general);
+            const bool ok =
+                s.ngx_fg
+                    ? XrVendor::GenerateDlss(cmd, frame, eye, cameras.views[eye], 1, 1)
+                    : XrVendor::Fidelity(s.gpu, s.device, cmd, s.eyes[eye]->fg_ctx, frame, true);
+            if (!ok) {
+                s.fg_failed = true;
+                s.have_history = false;
+                return pair;
+            }
+            pair.generated[0][eye] = frame.generated.view;
+        }
+        pair.count = !reset && slots ? 1 : 0;
     }
     return pair;
 }

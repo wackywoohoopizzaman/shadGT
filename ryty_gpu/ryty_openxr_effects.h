@@ -27,15 +27,20 @@ bool Dlss(vk::CommandBuffer cmd, const XrEffectFrame& frame, unsigned eye);
 } // namespace XrVendor
 class XrEyeEffects {
   public:
-    enum class Stage { Scene };
+    enum class Stage { Scene, FrameGeneration };
     XrEyeEffects(const Instance&, Stage);
     ~XrEyeEffects();
+    static constexpr unsigned MaxIntermediate = 1;
+    unsigned GenerationLimit() const;
     struct Pair {
         std::array<vk::Image, 2> reconstructed{}; // linear HDR in GENERAL layout
+        std::array<std::array<vk::ImageView, 2>, MaxIntermediate> generated{};
+        unsigned count{};
     };
     Pair Process(vk::CommandBuffer cmd, const OpenXrOutput::StereoImages& source,
                  const OpenXrOutput::ViewFrame& cameras, vk::Extent2D input,
-                 const std::array<vk::Extent2D, 2>& output, int64_t source_interval_ns);
+                 const std::array<vk::Extent2D, 2>& output, int64_t source_interval_ns,
+                 unsigned slots = 1);
 
   private:
     struct Impl;

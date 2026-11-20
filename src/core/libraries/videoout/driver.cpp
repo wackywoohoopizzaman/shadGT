@@ -23,6 +23,7 @@
 #endif
 #ifdef RYGT_OPENXR
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -534,6 +535,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     }
 
     if (!is_eop) {
+#ifdef RYGT_OPENXR
+        if (xr_frame) Vulkan::RytyDlssG::MarkXrFrame(xr_frame->reflex_token, Vulkan::RytyDlssG::XrMarker::RenderEnd);
+#endif
         // PERF-210: on the game's thread, never the command thread
         const u64 anti_lag_frame = presenter->AntiLagInput();
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them

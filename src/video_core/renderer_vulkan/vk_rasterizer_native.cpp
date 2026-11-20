@@ -19239,14 +19239,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             xr_copies.output->write_version.load(std::memory_order_relaxed) != xr_copies.output_version)
             xr_copies = {};
 #endif
+#ifdef RYGT_OPENXR
+        // GT7 depth-tests late cockpit overlays against the scene without writing Z.
+        // NoteWrites advances every bound attachment's version, even on a read-only bind.
+        const bool keep_xr_depth = has_xr_eyes && xr_scene.confirmed_eyes && xr_scene.frame == frame &&
+            targets.depth && targets.depth == xr_scene.depth &&
+            targets.depth->write_version.load() == xr_scene.depth_version &&
+            !regs.depth_control.depth_write_enable && !s.dynamic.depth_write_enabled &&
+            !regs.depth_render_control.depth_clear_enable && !targets.state.depth_stencil_attachment.depth_clear &&
+            std::ranges::find(b.stored, targets.depth) == b.stored.end();
+#endif
         NoteWrites(&targets, b);
 #ifdef RYGT_OPENXR
+        if (keep_xr_depth)
+            xr_scene.depth_version = targets.depth->write_version.load();
         if (drew_xr_movie)
             xr_movie = {targets.colors[0], frame, targets.colors[0]->write_version.load()};
         if (has_xr_eyes) {
             static const bool process_eyes = [] {
                 const char* sr = std::getenv("SHADGT_OPENXR_UPSCALER");
-                return sr && (std::string_view{sr} == "dlss" || std::string_view{sr} == "fsr");
+                const char* fg = std::getenv("SHARED_OPENXR_FRAMEGEN");
+                return (sr && (std::string_view{sr} == "dlss" || std::string_view{sr} == "fsr")) ||
+                       (fg && (std::string_view{fg} == "1" || std::string_view{fg} == "dlss"));
             }();
             if (process_eyes)
                 NoteXrScene(*pipeline, targets, b);
@@ -19899,10 +19913,12 @@ void NativeRenderer::NoteXrScene(const GraphicsPipeline& pipeline, const Targets
         Gt7XrCamera::PackExtent(mv->info.size.width, mv->info.size.height) == Gt7XrCamera::game_eye_extent.load()) {
         if (xr_scene.frame != frame || xr_scene.color != color ||
             xr_scene.motion != mv || xr_scene.depth != depth)
-            xr_scene = {color, mv, depth, frame};
+            xr_scene = {color, mv, depth, mv->info.guest_address, depth->info.guest_address, frame};
         const u32 layer = t.color_ranges[1].layer;
         if (layer < 2)
             xr_scene.confirmed_eyes &= ~(1u << layer);
+        xr_scene.motion_version = mv->write_version.load();
+        xr_scene.depth_version = depth->write_version.load();
         return;
     }
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
@@ -19928,6 +19944,8 @@ void NativeRenderer::NoteXrScene(const GraphicsPipeline& pipeline, const Targets
             continue;
         xr_scene.scale[layer] = {-c[14] / w, -c[15] / h, c[20], c[21]};
         xr_scene.confirmed_eyes |= 1u << layer;
+        xr_scene.motion_version = xr_scene.motion->write_version.load();
+        xr_scene.depth_version = xr_scene.depth->write_version.load();
         if (Gt7XrCamera::reconstruction_extent.load(std::memory_order_relaxed))
             ReconstructXrScene(t);
         break;
@@ -20006,6 +20024,31 @@ void NativeRenderer::GetXrEyeCopies(const Native::ImageEntry& output, Display& d
             // Both SRVs retain the flip shader's guest channel mapping and eye selection.
             display.xr_eyes = copy.reconstructed_eyes;
             display.temporal_images[Display::XrEyePicture] = copy.reconstructed_image;
+            const auto& size = copy.reconstructed_image->info.size;
+            display.xr_color_size = vk::Extent2D{size.width, size.height};
+        }
+        if (xr_scene.confirmed_eyes == 3 && xr_scene.frame == copy.frame && !display.xr_movie) {
+            const auto live = [&](VAddr address, const Native::ImageEntry* saved, u64 version) {
+                return registry->FindExisting(address, [&](const Native::ImageEntry& item) {
+                    return &item == saved && item.write_version.load() == version;
+                });
+            };
+            const auto* depth = live(xr_scene.depth_address, xr_scene.depth, xr_scene.depth_version);
+            const auto* motion = live(xr_scene.motion_address, xr_scene.motion, xr_scene.motion_version);
+            if (depth && motion) {
+                VideoCore::ImageViewInfo view{};
+                view.type = AmdGpu::ImageType::Color2D;
+                view.range.extent.layers = 1;
+                view.range.extent.levels = 1;
+                for (u32 eye = 0; eye < 2; ++eye) {
+                    view.range.base.layer = eye;
+                    view.format = vk::Format::eR32Sfloat;
+                    display.xr_depth[eye] = View(*depth, view, ViewUse::Sampled);
+                    view.format = vk::Format::eR16G16Sfloat;
+                    display.xr_motion[eye] = View(*motion, view, ViewUse::Sampled);
+                }
+                display.xr_motion_scale = xr_scene.scale;
+            }
         }
         display.xr_eye_size = vk::Extent2D{source->info.size.width, source->info.size.height};
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ryty_gpu/ryty_openxr.h"
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_upscale_quality.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include <cmath>
 #include <filesystem>
@@ -13,9 +14,52 @@
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 using namespace Vulkan;
 static_assert(Gt7XrCamera::SceneDimension(3072, 3072, 4096, 4096, 50) == 1536);
+static_assert(RytyUpscale::VrInputDimension(3072, RytyUpscale::Quality::Performance) == 1536);
+static_assert(RytyUpscale::VrInputDimension(3264, RytyUpscale::Quality::Performance) == 1632);
+static_assert(RytyUpscale::VrInputDimension(3072, RytyUpscale::Quality::Quality) == 2048);
+static_assert(RytyUpscale::VrInputDimension(3264, RytyUpscale::Quality::Native) == 3264);
+static_assert(RytyUpscale::VrInputDimension(Gt7XrCamera::SceneDimension(1920, 1920, 2048, 2048, 75),
+                                            RytyUpscale::Quality::Performance) == 720);
+static_assert(RytyUpscale::VrInputDimension(1, RytyUpscale::Quality::UltraPerformance) == 1);
 static_assert(Gt7XrCamera::SceneDimension(3264, 3264, 4096, 4096, 100) == 3264);
 static_assert(Gt7XrCamera::SceneDimension(1400, 1502, 1600, 1800, 75) == 1127);
 static_assert(Gt7XrCamera::SceneDimension(1600, 2000, 1800, 2200, 100) == 1800);
+constexpr int InsertedPairs(int rate, int refresh, unsigned limit = 1) {
+    int64_t credit{};
+    int count{};
+    for (int i = 0; i < rate; ++i)
+        count += Gt7XrCamera::IntermediateSlots(credit, 1'000'000'000 / refresh,
+                                                1'000'000'000 / rate, limit);
+    return count;
+}
+static_assert(InsertedPairs(60, 90) == 30 && InsertedPairs(60, 72) == 12);
+static_assert(InsertedPairs(60, 60) == 0 && InsertedPairs(30, 90) == 30);
+static_assert(InsertedPairs(45, 90) == 45 && InsertedPairs(60, 120) == 60);
+constexpr bool CheckSourceHistory() {
+    GameStereoFrame a{};
+    a.source_id = 20;
+    a.source_time_ns = 100'000'000;
+    a.cameras.id = 11;
+    auto b = a;
+    b.source_id++;
+    b.source_time_ns += 20'000'000;
+    if (Gt7XrCamera::SourceInterval(a, b) != 20'000'000)
+        return false; // Two new game images reused one prediction.
+    b.cameras.id += 3;
+    if (Gt7XrCamera::SourceInterval(a, b) != 20'000'000)
+        return false;
+    b.cameras.origin++;
+    if (Gt7XrCamera::SourceInterval(a, b))
+        return false;
+    b.cameras.origin--;
+    b.source_id++;
+    if (Gt7XrCamera::SourceInterval(a, b) || Gt7XrCamera::SourceInterval(a, a))
+        return false;
+    b.source_id--;
+    b.source_time_ns += 100'000'000;
+    return Gt7XrCamera::SourceInterval(a, b) == 0;
+}
+static_assert(CheckSourceHistory());
 template <class T>
 auto must(T result) {
     if (result.result != vk::Result::eSuccess)
