@@ -52,6 +52,9 @@
 #include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_camera.h"
+#endif
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -490,6 +493,9 @@ bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, 
 }
 
 #include "ryty_gpu/ryty_gt7_hdr_status.inl"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_gt7_openxr_camera.inl"
+#endif
 
 void InstallLewisChallenge(u8* base) {
     const char* env = std::getenv("SHADGT_LEWIS");
@@ -4308,6 +4314,11 @@ void RytyApplyGamePatches() {
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+#ifdef RYGT_OPENXR
+    if (Common::IsGt7()) {
+        Gt7Camera::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    }
+#endif
     Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
     GtsProOptions::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GTS-506
