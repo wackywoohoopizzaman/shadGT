@@ -3,6 +3,10 @@
 #include "ryty_gpu/ryty_openxr_camera.h"
 #include "ryty_gpu/ryty_upscale_quality.h"
 #include "ryty_gpu/openxr_system.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_effects.h"
+#include "ryty_gpu/ryty_dlssg.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,9 +21,12 @@
 #include <atomic>
 #include <charconv>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <openxr/openxr_platform.h>
 #include <sstream>
+#include <thread>
+#include <system_error>
 
 namespace Vulkan {
 namespace {
@@ -48,6 +55,108 @@ bool Success(XrResult result, const char* operation) {
     return false;
 }
 
+#ifdef RYGT_OPENXR
+// One real frame can await its display slot while the recorder works on the next
+// game frame. Swapchain images are already released; copy all projection metadata.
+class PacedProjection {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    void Schedule(XrSession session, XrSpace space, XrEnvironmentBlendMode blend, XrTime time,
+                  const std::array<XrCompositionLayerProjectionView, 2>& views,
+                  Clock::time_point due, u32 reflex) {
+        std::lock_guard lock(mutex);
+        if (!worker.joinable())
+            worker = std::thread([this] { Run(); });
+        job = Job{session, space, blend, time, views, due, reflex};
+        changed.notify_one();
+    }
+
+    bool Finish() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [this] { return !job; });
+        return successful;
+    }
+
+    ~PacedProjection() {
+        Finish();
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        changed.notify_one();
+        if (worker.joinable())
+            worker.join();
+    }
+
+private:
+    struct Job {
+        XrSession session;
+        XrSpace space;
+        XrEnvironmentBlendMode blend;
+        XrTime time;
+        std::array<XrCompositionLayerProjectionView, 2> views;
+        Clock::time_point due;
+        u32 reflex;
+    };
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::thread worker;
+    std::optional<Job> job;
+    bool successful{};
+    bool stopping{};
+
+    void Run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            changed.wait(lock, [this] { return stopping || job.has_value(); });
+            if (stopping)
+                return;
+            const Job frame = *job;
+            lock.unlock();
+            std::this_thread::sleep_until(frame.due);
+            const XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+                                                          nullptr,
+                                                          0,
+                                                          frame.space,
+                                                          2,
+                                                          frame.views.data()};
+            const auto* layer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+            const XrFrameEndInfo end{
+                XR_TYPE_FRAME_END_INFO, nullptr, frame.time, frame.blend, 1, &layer};
+            bool ok;
+            RytyDlssG::MarkXrFrame(frame.reflex, RytyDlssG::XrMarker::PresentStart);
+            {
+                std::scoped_lock queue_lock{Scheduler::submit_mutex};
+                ok = Success(xrEndFrame(frame.session, &end), "end paced frame");
+            }
+            RytyDlssG::MarkXrFrame(frame.reflex, RytyDlssG::XrMarker::PresentEnd);
+            lock.lock();
+            successful = ok;
+            job.reset();
+            changed.notify_all();
+        }
+    }
+};
+
+XrView InterpolateView(const XrView& a, const XrView& b, float t) {
+    XrView v = b;
+    const auto mix = [t](float x, float y) { return x + (y - x) * t; };
+    const auto& p = a.pose.position;
+    const auto& r = b.pose.position;
+    v.pose.position = {mix(p.x, r.x), mix(p.y, r.y), mix(p.z, r.z)};
+    const auto x = a.pose.orientation, y = b.pose.orientation;
+    const float sign = x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w < 0 ? -1.f : 1.f;
+    XrQuaternionf q{mix(x.x, sign * y.x), mix(x.y, sign * y.y), mix(x.z, sign * y.z),
+                    mix(x.w, sign * y.w)};
+    const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    v.pose.orientation = {q.x / n, q.y / n, q.z / n, q.w / n};
+    const auto angle = [&](float x, float y) { return std::atan(mix(std::tan(x), std::tan(y))); };
+    v.fov = {angle(a.fov.angleLeft, b.fov.angleLeft), angle(a.fov.angleRight, b.fov.angleRight),
+             angle(a.fov.angleUp, b.fov.angleUp), angle(a.fov.angleDown, b.fov.angleDown)};
+    return v;
+}
+#endif
 
 struct EyeTarget {
     XrSwapchain chain{};
@@ -98,25 +207,40 @@ struct OpenXrOutput::State {
     vk::UniqueDescriptorSetLayout descriptors;
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
-    bool spatial_upscale{};
     std::atomic<bool> enabled{true};
     bool running{}, focused{}, seat_calibrated{}, hdr_reported{};
+    bool spatial_upscale{};
+#ifdef RYGT_OPENXR
+    std::unique_ptr<XrEyeEffects> effects;
+    bool sample_on_draw{};
+    Gt7XrCamera::DrawTracking clock_anchor{};
+    PacedProjection pacing;
+    std::optional<GameStereoFrame> previous;
+    int64_t slot_credit{}, game_period{};
+    double measured_game_ns{};
+#endif
 #ifdef SHADGT_DIAGNOSTICS
     int last_mode{-1};
 #endif
     uint64_t frame_id{};
     uint64_t origin{};
-    bool frame_begun{}, screen_ready{};
+    bool frame_begun{}, screen_ready{}, end_pending{};
     XrTime display_time{};
     XrDuration display_period{};
     std::optional<ViewFrame> located;
 
     void CloseSession() {
+#ifdef RYGT_OPENXR
+        if (end_pending) {
+            pacing.Finish();
+            end_pending = false;
+        }
+#endif
         if (Gt7XrCamera::Requested()) {
+            Gt7XrCamera::dlss_material_mip_bias.store(0.0f, std::memory_order_relaxed);
             Gt7XrCamera::SetAllocationSize({});
             Gt7XrCamera::game_eye_extent = 0;
             Gt7XrCamera::reconstruction_extent = 0;
-            Gt7XrCamera::dlss_material_mip_bias = 0;
             Gt7XrCamera::Publish({});
         }
         for (auto& eye : eyes) {
@@ -203,6 +327,18 @@ bool OpenXrOutput::State::Initialize() {
         !proc("xrGetVulkanInstanceExtensionsKHR", instances) ||
         !proc("xrGetVulkanDeviceExtensionsKHR", devices))
         return false;
+#if defined(_WIN32) && defined(RYGT_OPENXR)
+    if (extensions.performance_clock) {
+        PFN_xrConvertWin32PerformanceCounterToTimeKHR convert{};
+        LARGE_INTEGER counter{};
+        if (proc("xrConvertWin32PerformanceCounterToTimeKHR", convert) &&
+            QueryPerformanceCounter(&counter)) {
+            clock_anchor.host = std::chrono::steady_clock::now();
+            if (XR_FAILED(convert(xr, &counter, &clock_anchor.xr_time)))
+                clock_anchor.xr_time = 0;
+        }
+    }
+#endif
     XrGraphicsRequirementsVulkanKHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
     if (!Success(requirements(xr, system, &req), "Vulkan requirements"))
         return false;
@@ -274,6 +410,20 @@ bool OpenXrOutput::CanCapture() const {
 
 bool OpenXrOutput::State::Bind(const Instance& graphics) {
     device = graphics.GetDevice();
+#ifdef RYGT_OPENXR
+    const char* fg = std::getenv("SHARED_OPENXR_FRAMEGEN");
+    const bool generate = fg && (std::string_view{fg} == "1" || std::string_view{fg} == "dlss");
+    sample_on_draw = generate || (RytyDlssG::XrReflexRequested() && RytyDlssG::Active());
+    if (generate)
+        effects = std::make_unique<XrEyeEffects>(graphics, XrEyeEffects::Stage::FrameGeneration);
+    if (const char* fps = std::getenv("SHADGT_FPS_LOCK")) {
+        const std::string_view value{fps};
+        unsigned rate{};
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), rate);
+        if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && rate > 0)
+            game_period = 1'000'000'000LL / rate;
+    }
+#endif
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
     binding.instance = graphics.GetInstance();
     binding.physicalDevice = graphics.GetPhysicalDevice();
@@ -501,6 +651,11 @@ bool OpenXrOutput::State::Poll() {
                 Gt7XrCamera::Publish({});
             if (!Success(xrEndSession(session), "end session"))
                 return false;
+#ifdef RYGT_OPENXR
+            previous.reset();
+            slot_credit = 0;
+            measured_game_ns = 0;
+#endif
             running = false;
             active_sessions.fetch_sub(1, std::memory_order_relaxed);
             if (seat) {
@@ -594,7 +749,7 @@ void OpenXrOutput::State::Draw(vk::CommandBuffer cmd, const EyeTarget& eye, uint
                                        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
                                        .pImageInfo = &image};
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *layout, 0, write);
-    const std::array<uint32_t, 5> sampling{encoded, region, 0, eye.size.width,
+    const std::array<uint32_t, 5> sampling{encoded, region, spatial_upscale, eye.size.width,
                                            eye.size.height};
     cmd.pushConstants(*layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(sampling),
                       sampling.data());
@@ -604,6 +759,17 @@ void OpenXrOutput::State::Draw(vk::CommandBuffer cmd, const EyeTarget& eye, uint
 
 std::optional<OpenXrOutput::ViewFrame> OpenXrOutput::BeginFrame() {
     auto& s = *state;
+#ifdef RYGT_OPENXR
+    if (s.end_pending) {
+        const bool ok = s.pacing.Finish();
+        s.end_pending = false;
+        if (!ok) {
+            s.enabled = false;
+            s.CloseSession();
+            return {};
+        }
+    }
+#endif
     if (!s.enabled)
         return {};
     if (s.frame_begun)
@@ -651,7 +817,21 @@ std::optional<OpenXrOutput::ViewFrame> OpenXrOutput::BeginFrame() {
             s.located = result;
     }
     if (Gt7XrCamera::Requested()) {
-        Gt7XrCamera::Publish(s.located);
+        Gt7XrCamera::DrawTracking tracking{};
+#ifdef RYGT_OPENXR
+        if (s.located && s.sample_on_draw) {
+            tracking = s.clock_anchor;
+            if (tracking.xr_time) {
+                tracking.xr_time += s.display_period;
+            } else {
+                tracking.host = std::chrono::steady_clock::now();
+                tracking.xr_time = s.display_time;
+            }
+            tracking.session = s.session;
+            tracking.seat = s.seat;
+        }
+#endif
+        Gt7XrCamera::Publish(s.located, tracking);
     }
     return s.located;
 }
@@ -683,9 +863,14 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
     if (frame.is_hdr && !s.hdr_reported)
         LOG_WARNING(Render_Vulkan, "OpenXR requires SDR output");
     s.hdr_reported = frame.is_hdr;
+    using Images = std::array<vk::ImageView, 2>;
     using Views = std::array<XrView, 2>;
     const Views views = packed ? game->cameras.views : (s.located ? s.located->views : Views{});
-    const auto submit = [&] {
+    bool effects_recorded = false;
+#ifdef RYGT_OPENXR
+    std::chrono::steady_clock::time_point next_display_slot{};
+#endif
+    const auto submit = [&](const Images& images, const Views& views, bool real_frame) {
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         std::array<XrCompositionLayerProjectionView, 2> projection_views{};
@@ -718,7 +903,7 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
                     auto& eye = s.eyes[i];
                     const bool use_eye = separate || game_eyes;
                     s.Draw(cmd, eye, indices[i],
-                           use_eye ? stereo->colors[i] : frame.image_view,
+                           images[i] ? images[i] : (use_eye ? stereo->colors[i] : frame.image_view),
                            use_eye ? stereo->display_encoded : true,
                            packed && !game_eyes ? static_cast<uint32_t>(i + 1) : 0);
                     const XrSwapchainSubImage sub{
@@ -736,6 +921,7 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
                 // A released swapchain image must contain this submission's pixels.
                 // A late GPU copy can otherwise expose the previous use of the same image.
                 scheduler.Finish();
+                effects_recorded = false;
                 if (paired) {
                     projection.space = s.seat;
                     projection.viewCount = 2;
@@ -760,19 +946,85 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
                 }
             }
         }
+        if (effects_recorded) {
+            scheduler.Finish();
+            effects_recorded = false;
+        }
+#ifdef RYGT_OPENXR
+        // Copy while waiting for the display slot. The final real presentation can wait
+        // on the worker while the recorder starts the next game frame.
+        if (real_frame && layer && next_display_slot != PacedProjection::Clock::time_point{}) {
+            s.pacing.Schedule(s.session, s.seat, s.blend, s.display_time, projection_views,
+                              next_display_slot, game->reflex_token);
+            s.end_pending = true;
+            s.frame_begun = false;
+            s.located.reset();
+            return true;
+        }
+#endif
         const XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO, nullptr,
                                  s.display_time,         s.blend,
                                  layer ? 1u : 0u,        layer ? &layer : nullptr};
+#ifdef RYGT_OPENXR
+        const u32 real_token = real_frame && layer && game ? game->reflex_token : 0;
+        RytyDlssG::MarkXrFrame(real_token, RytyDlssG::XrMarker::PresentStart);
+#endif
         {
             std::scoped_lock lock{Scheduler::submit_mutex};
             if (!Success(xrEndFrame(s.session, &end), "end frame"))
                 s.enabled = false;
         }
+#ifdef RYGT_OPENXR
+        RytyDlssG::MarkXrFrame(real_token, RytyDlssG::XrMarker::PresentEnd);
+#endif
         s.frame_begun = false;
         s.located.reset();
         return layer != nullptr && s.enabled;
     };
-    [[maybe_unused]] const bool submitted = s.frame_begun && submit();
+#ifdef RYGT_OPENXR
+    if (s.effects && game_eyes && !movie && !frame.is_hdr && s.screen_ready) {
+        const auto& current = game->cameras;
+        const auto interval = s.previous ? Gt7XrCamera::SourceInterval(*s.previous, *game) : 0;
+        if (interval) {
+            s.measured_game_ns =
+                s.measured_game_ns > 0 ? .9 * s.measured_game_ns + .1 * interval : double(interval);
+        } else {
+            s.measured_game_ns = 0;
+            s.slot_credit = 0;
+        }
+        const auto slots =
+            interval ? Gt7XrCamera::IntermediateSlots(
+                           s.slot_credit, s.display_period,
+                           std::max(s.game_period, static_cast<int64_t>(s.measured_game_ns)),
+                           s.effects->GenerationLimit())
+                     : 0u;
+        effects_recorded = true;
+        const auto processed =
+            s.effects->Process(scheduler.DirectCommandBuffer(), *stereo, current, game_eye_size,
+                               {s.eyes[0].size, s.eyes[1].size}, interval, slots);
+        if (processed.count) {
+            Views intermediate = views;
+            for (size_t eye = 0; eye < views.size(); ++eye) {
+                intermediate[eye] =
+                    InterpolateView(s.previous->cameras.views[eye], views[eye], 0.5f);
+            }
+            if (submit(processed.generated[0], intermediate, false)) {
+                const auto half_interval = static_cast<int64_t>(s.measured_game_ns / 2);
+                next_display_slot =
+                    PacedProjection::Clock::now() +
+                    std::chrono::nanoseconds(std::max(s.display_period, half_interval));
+                BeginFrame();
+            }
+        }
+        if (s.running) {
+            s.previous = *game;
+        }
+    } else {
+        s.previous.reset();
+        s.slot_credit = 0;
+    }
+#endif
+    [[maybe_unused]] const bool submitted = s.frame_begun && submit({}, views, true);
 #ifdef SHADGT_DIAGNOSTICS
     const int mode = movie ? 3 : game_eyes ? 2 : int(paired);
     if (submitted && s.last_mode != mode) {
@@ -792,7 +1044,7 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
 #endif
     if (!s.enabled)
         s.CloseSession();
-    else if (Gt7XrCamera::Requested())
+    else if (Gt7XrCamera::Requested() && !s.end_pending)
         BeginFrame();
 }
 } // namespace Vulkan

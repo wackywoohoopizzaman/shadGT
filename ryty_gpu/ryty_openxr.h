@@ -67,5 +67,8 @@ private:
 };
 struct GameStereoFrame {
     OpenXrOutput::ViewFrame cameras;
+    uint64_t source_id{};
+    int64_t source_time_ns{}; // Producer clock at display-buffer selection.
+    uint32_t reflex_token{};
 };
 } // namespace Vulkan
