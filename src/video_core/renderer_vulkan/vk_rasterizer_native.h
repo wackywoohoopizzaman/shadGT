@@ -177,7 +177,10 @@ public:
         std::optional<RytyUpscale::TemporalInputs> temporal;
 #ifdef RYGT_OPENXR
         std::array<vk::ImageView, 2> xr_eyes{};
+        vk::Extent2D xr_color_size{};
         vk::Extent2D xr_eye_size{};
+        std::array<vk::ImageView, 2> xr_depth{}, xr_motion{};
+        std::array<std::array<float, 4>, 2> xr_motion_scale{};
         bool xr_movie{};
 #endif
     };
@@ -434,7 +437,8 @@ private:
     // The two final eye-copy draws must refer to the same, still-current image.
     struct XrSceneInputs {
         const Native::ImageEntry *color{}, *motion{}, *depth{};
-        u64 frame{};
+        VAddr motion_address{}, depth_address{};
+        u64 frame{}, motion_version{}, depth_version{};
         std::array<std::array<float, 4>, 2> scale{};
         u32 confirmed_eyes{};
     } xr_scene;

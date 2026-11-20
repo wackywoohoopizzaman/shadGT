@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #ifdef RYGT_OPENXR
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #endif
 #ifdef RYTY_GPU
 #include "core/file_format/psf.h"
@@ -429,6 +430,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     std::shared_ptr<const Vulkan::GameStereoFrame> xr_frame;
 #ifdef RYGT_OPENXR
     xr_frame = Vulkan::Gt7XrCamera::Claim(buf_id);
+    if (xr_frame) Vulkan::RytyDlssG::MarkXrFrame(xr_frame->reflex_token, Vulkan::RytyDlssG::XrMarker::RenderEnd);
 #endif
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {

@@ -52,6 +52,7 @@
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
 #ifdef RYGT_OPENXR
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #endif
 
 namespace Vulkan {

@@ -8,6 +8,7 @@ static Signal original_signal;
 static Tracker original_tracker;
 static SelectBuffer original_select;
 static std::optional<Vulkan::GameStereoFrame> drawing;
+static u64 source_id{};
 static s32 drawing_slot = -1;
 static u8* image;
 static bool installed, requested_mode;
@@ -144,8 +145,16 @@ static void PS4_SYSV_ABI SelectGameBuffer(void* commands, s32 port, s32 slot) {
     drawing_slot = port == 1 ? slot : -1;
     drawing.reset();
     if (drawing_slot >= 0) {
-        if (const auto views = Vulkan::Gt7XrCamera::Read()) {
-            drawing = Vulkan::GameStereoFrame{*views};
+        ++source_id;
+        const auto token = requested_mode && image[0x7119c8a] &&
+                                   *reinterpret_cast<const s32*>(image + 0x70118a8) == 2
+                               ? Vulkan::RytyDlssG::BeginXrReflexFrame()
+                               : 0;
+        if (const auto views = Vulkan::Gt7XrCamera::ReadForDraw()) {
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            drawing = Vulkan::GameStereoFrame{
+                *views, source_id,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(), token};
         }
     }
     Vulkan::Gt7XrCamera::TagBuffer(drawing_slot, nullptr);
@@ -200,6 +209,8 @@ static bool PS4_SYSV_ABI OnTracker(void* output, s32 slot, u64 time) {
     input.tracking_valid = 1;
     input.tracking_enabled = 1;
     if (drawing_slot == slot && *reinterpret_cast<const s32*>(image + 0x70118a8) == 2) {
+        Vulkan::RytyDlssG::MarkXrFrame(frame->reflex_token,
+                                       Vulkan::RytyDlssG::XrMarker::CameraReady);
         Vulkan::Gt7XrCamera::TagBuffer(slot, &*frame);
     }
     // The guest's false branch preserves the camera input already written above.

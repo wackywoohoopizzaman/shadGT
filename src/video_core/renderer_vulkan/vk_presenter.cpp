@@ -1884,7 +1884,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
 #ifdef RYGT_OPENXR
     if (auto* headset = instance.Headset()) {
         const OpenXrOutput::StereoImages eyes{
-            xr_frame ? xr_frame->cameras.id : 0, display->xr_eyes, true, display->xr_movie};
+            xr_frame ? xr_frame->cameras.id : 0, display->xr_eyes, true, display->xr_movie,
+            display->xr_depth, display->xr_motion, display->xr_motion_scale, display->xr_color_size};
         headset->Present(draw_scheduler, *frame, xr_frame ? &eyes : nullptr, xr_frame,
                          display->xr_eye_size);
     }
