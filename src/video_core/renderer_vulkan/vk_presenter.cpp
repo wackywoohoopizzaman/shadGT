@@ -1883,7 +1883,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     draw_scheduler.Flush(info);
 #ifdef RYGT_OPENXR
     if (auto* headset = instance.Headset()) {
-        headset->Present(draw_scheduler, *frame, nullptr, xr_frame);
+        const OpenXrOutput::StereoImages eyes{
+            xr_frame ? xr_frame->cameras.id : 0, display->xr_eyes, true, display->xr_movie};
+        headset->Present(draw_scheduler, *frame, xr_frame ? &eyes : nullptr, xr_frame,
+                         display->xr_eye_size);
     }
 #endif
     return frame;

@@ -140,6 +140,9 @@
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/native/slow_call_trace.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_camera.h"
+#endif
 #include "video_core/renderer_vulkan/kept_shadow_map.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
@@ -11664,7 +11667,14 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
-            if (bindable && size != 0) {
+#ifdef RYGT_OPENXR
+            if (stage.pgm_hash == XrStereoTaaShader && stage.sw_stage == Shader::SwStage::Fragment &&
+                bindable && !desc.is_written && sharp_size == 28 * sizeof(float) &&
+                size == sharp_size && Gt7XrCamera::Requested() && OpenXrOutput::IsRunning()) {
+                info = XrTaaConstants(base, alignment);
+            }
+#endif
+            if (bindable && size != 0 && !info.buffer) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, SHADGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
@@ -12019,6 +12029,21 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 #endif
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
+#ifdef RYGT_OPENXR
+        // GT7's stereo glare combine leaves its sharp highlight input on the left
+        // slice for both eyes. The first blur level uses the same grid and selects
+        // the eye for this draw. Apply its slice before looking up the Vulkan view.
+        if (stage.pgm_hash == 0x7dcd79d1 && stage.images.size() == 7 &&
+            &image_desc == &stage.images[5] && Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) &&
+            OpenXrOutput::IsRunning() &&
+            tsharp.GetType() == AmdGpu::ImageType::Color2DArray &&
+            tsharp.base_array == 0 && tsharp.last_array == 1) {
+            const auto blur = stage.images[0].GetSharp(stage);
+            if (blur.GetType() == tsharp.GetType() && blur.base_array == 1 &&
+                blur.last_array == 1 && blur.width == tsharp.width && blur.height == tsharp.height)
+                tsharp.base_array = 1;
+        }
+#endif
         {
             // DIAG-186 (diagnosis, with SHADGT_DIAG_PROGRAM_TEXTURES=<hash>): where that program's
             // small textures' descriptors were read (guest address of the T#'s first dword), and
@@ -16435,6 +16460,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+#ifdef RYGT_OPENXR
+    const bool has_xr_eyes = Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) != 0 &&
+                             OpenXrOutput::IsRunning();
+    const bool xr_results_surround =
+        has_xr_eyes && IsXrResultsSurround(*pipeline, targets, regs, b);
+    // Draws that change descriptors, replay a layer, or skip a stereo surround must run
+    // where the render state is owned. Ordinary scene draws remain eligible for workers.
+    const bool serial_xr_draw = has_xr_eyes &&
+        (xr_results_surround || (composition_fs && composition_fs->pgm_hash == 0xf3fc7237));
+    bool drew_xr_movie = false;
+    if (has_xr_eyes)
+        SetXrFadeProjection(*pipeline, targets, regs, b);
+#else
+    constexpr bool serial_xr_draw = false;
+#endif
     static thread_local VertexIndexState vertex_index;
     const VertexIndexState* vi = &vertex_index;
     {
@@ -16958,7 +16998,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const bool prohibited_clear=any_clear;
         const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
-        const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && !has_feedback &&
+        const bool inline_safe=!serial_xr_draw && bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && !has_feedback &&
             !scale_composition && !native_fsr_composition;
 #if !defined(NDEBUG)
         static const bool serial_audit=[] {const char* p=std::getenv("SHADGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
@@ -16975,7 +17015,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // Do not build a captured pass when even its prefix and pass nodes
         // cannot fit. Recheck on later serial draws as retired nodes may free.
         const bool no_pass_room=!parallel->active && !parallel->coordinator->HasRoomForPass();
-        bool fast_reject=pipeline->LdsEmulation()!=0 || no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+        bool fast_reject=serial_xr_draw || pipeline->LdsEmulation()!=0 || no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
@@ -18452,6 +18492,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         };
         const auto issue = [&] {
+#ifdef RYGT_OPENXR
+        if (xr_results_surround) {
+            return;
+        }
+#endif
         const CmdBuf cmdbuf{Ctx().stream.cmd}; // GT7-UW: the HUD list's when it is swapped in
         if (indirect) {
             RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
@@ -18850,6 +18895,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
             }
             record_wide_draw(); // WIDE-008/031/060
+#ifdef RYGT_OPENXR
+            if (has_xr_eyes && BindXrMovieRightEye(*pipeline, targets, regs, b)) {
+                bind_state();
+                record_draw();
+                drew_xr_movie = true;
+            }
+#endif
         }
         if (lds_used) {
             s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
@@ -18919,7 +18971,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[7]};
+#ifdef RYGT_OPENXR
+        // A draw between the two eye copies can add content to the packed frame.
+        if (xr_copies.output && targets.colors[0] == xr_copies.output &&
+            xr_copies.output->write_version.load(std::memory_order_relaxed) != xr_copies.output_version)
+            xr_copies = {};
+#endif
         NoteWrites(&targets, b);
+#ifdef RYGT_OPENXR
+        if (drew_xr_movie)
+            xr_movie = {targets.colors[0], frame, targets.colors[0]->write_version.load()};
+        if (has_xr_eyes) {
+            NoteXrEyeCopy(*pipeline, targets, b);
+        }
+#endif
     }
     for (size_t cb = 0; cb < targets.colors.size(); ++cb) {
         const auto* color = targets.colors[cb];
@@ -19121,6 +19186,241 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
     {RecordPartitionClock report_partition{parallel?&parallel->record_partition[partition_mode][3]:nullptr};Report();}
 }
+
+#ifdef RYGT_OPENXR
+// FIX-GT7-211: Music Rally's flat results screen masks the area outside an inset race picture.
+// In the native cockpit the race fills both eyes. Its mono stencil applies this
+// surround to a corner of layer zero, while the stamp and buttons have stereo draws.
+bool NativeRenderer::IsXrResultsSurround(const GraphicsPipeline& pipeline, const Targets& targets,
+                                         const AmdGpu::Regs& regs, const DrawBindings& bindings) {
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || fs->pgm_hash != 0xb34c2a25 || !Gt7XrCamera::Requested())
+        return false;
+    const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto* color = targets.colors[0];
+    const auto* stencil = targets.depth;
+    if (!vs || vs->pgm_hash != 0xff1b4fa9 || !color || !stencil ||
+        targets.state.num_color_attachments != 1 || targets.color_ranges[0].layer != 0 ||
+        targets.color_ranges[0].layers != 2 || targets.state.num_layers != 1 ||
+        Gt7XrCamera::PackExtent(color->info.size.width, color->info.size.height) !=
+            Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) ||
+        stencil->info.size.width != 1920 || stencil->info.size.height != 1080 ||
+        !regs.depth_control.stencil_enable || regs.depth_control.depth_enable ||
+        !regs.blend_control[0].enable || regs.num_indices != 4 ||
+        regs.num_instances.NumInstances() != 2 ||
+        regs.primitive_type != AmdGpu::PrimitiveType::TriangleFan)
+        return false;
+
+    const auto& attributes = pipeline.GetFetchShader().attributes;
+    if (attributes.size() != 2 || bindings.sampled.size() != 1 || !bindings.sampled.front() ||
+        bindings.sampled.front()->info.size.width != 1 ||
+        bindings.sampled.front()->info.size.height != 1)
+        return false;
+    const auto positions = attributes[0].GetSharp(*vs);
+    const auto colour = attributes[1].GetSharp(*vs);
+    constexpr std::array<float, 8> corners{0, 0, 1920, 0, 1920, 1080, 0, 1080};
+    std::array<float, 8> xy;
+    std::array<float, 4> rgba;
+    if (positions.stride != 8 || positions.GetSize() != sizeof(xy) ||
+        colour.stride != 0 || colour.GetSize() != sizeof(rgba) ||
+        !Core::RytyMemory::GuardedCopy(xy.data(),
+            reinterpret_cast<const void*>(u64(positions.base_address)), sizeof(xy)) ||
+        !Core::RytyMemory::GuardedCopy(rgba.data(),
+            reinterpret_cast<const void*>(u64(colour.base_address)), sizeof(rgba)) ||
+        xy != corners || rgba[0] != 0.f || rgba[1] != 0.f || rgba[2] != 0.f) {
+        return false;
+    }
+
+    const auto& ops = regs.stencil_control;
+    constexpr auto keep = AmdGpu::StencilFunc::Keep;
+    const bool front_read_only = !regs.stencil_ref_front.stencil_write_mask ||
+        (ops.stencil_fail_front == keep && ops.stencil_zpass_front == keep &&
+         ops.stencil_zfail_front == keep);
+    const bool back_read_only = !regs.depth_control.backface_enable ||
+        !regs.stencil_ref_back.stencil_write_mask ||
+        (ops.stencil_fail_back == keep && ops.stencil_zpass_back == keep &&
+         ops.stencil_zfail_back == keep);
+    return front_read_only && back_read_only;
+}
+
+// The unbounded clip rectangle and 1920-unit gradient distinguish the Music Rally fade
+// from smaller HUD gradients that share the same fragment program.
+void NativeRenderer::SetXrFadeProjection(const GraphicsPipeline& pipeline, const Targets& targets,
+                                         const AmdGpu::Regs& regs, DrawBindings& bindings) {
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps || ps->pgm_hash != 0x36642599 || ps->buffers.empty())
+        return;
+    const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto* target = targets.colors[0];
+    if (!vs || vs->pgm_hash != 0x7faad7b1 || vs->buffers.empty() || !target ||
+        targets.state.num_layers != 2 || regs.num_indices != 4 ||
+        regs.num_instances.NumInstances() != 2 ||
+        Gt7XrCamera::PackExtent(target->info.size.width, target->info.size.height) !=
+            Gt7XrCamera::game_eye_extent.load())
+        return;
+    const auto gradient = ps->buffers[0].GetSharp(*ps);
+    const auto transforms = vs->buffers[0].GetSharp(*vs);
+    std::array<float, 20> material;
+    std::array<float, 64> local;
+    if (gradient.GetSize() != sizeof(material) || transforms.GetSize() != sizeof(local) ||
+        !Core::RytyMemory::GuardedCopy(material.data(),
+            reinterpret_cast<const void*>(u64(gradient.base_address)), sizeof(material)) ||
+        !Core::RytyMemory::GuardedCopy(local.data(),
+            reinterpret_cast<const void*>(u64(transforms.base_address)), sizeof(local))) {
+        return;
+    }
+    if (material[0] != -16384.f || material[1] != -16384.f ||
+        material[2] != 16384.f || material[3] != 16384.f ||
+        material[12] != 960.f || material[13] != 960.f)
+        return;
+    // The game supplies left, right, flat-screen and gradient transforms in order.
+    // Use its original full-screen projection for both eyes. Keeping the fourth
+    // matrix and fragment inputs preserves the authored falloff and beat-driven alpha.
+    std::copy_n(local.data() + 32, 16, local.begin());
+    std::copy_n(local.data() + 32, 16, local.begin() + 16);
+    constexpr auto vertex = u32(Shader::SwStage::Vertex);
+    for (size_t i = 0; i < bindings.writes.size(); ++i) {
+        const auto& write = bindings.writes[i];
+        if (bindings.write_sets[i] != Shader::Backend::StageSet(vertex) ||
+            write.dstBinding != 0 || !write.pBufferInfo)
+            continue;
+        const auto [buffer, offset, mapped] = Allocate(sizeof(local), r.instance.StorageMinAlignment());
+        std::memcpy(mapped, local.data(), sizeof(local));
+        const auto index = write.pBufferInfo - bindings.buffers.data();
+        bindings.buffers[index] = vk::DescriptorBufferInfo{buffer, offset, sizeof(local)};
+        bindings.push.AddOffset(Shader::Backend::StageStart(vertex).buffer, 0);
+        break;
+    }
+}
+
+// The intro's NV12 conversion is a single opaque draw. Its vertex shader has no
+// layer output, so the guest's stereo render target only receives layer zero.
+bool NativeRenderer::BindXrMovieRightEye(const GraphicsPipeline& pipeline, const Targets& targets,
+                                      const AmdGpu::Regs& regs, const DrawBindings& bindings) {
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps || ps->pgm_hash != 0xf3fc7237 || ps->images.size() != 2)
+        return false;
+    const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto* target = targets.colors[0];
+    if (!vs || vs->pgm_hash != 0x3c923970 || !target || targets.depth ||
+        targets.state.num_color_attachments != 1 || target->image->Desc().layers != 2 ||
+        Gt7XrCamera::PackExtent(target->info.size.width, target->info.size.height) !=
+            Gt7XrCamera::game_eye_extent.load() ||
+        regs.num_indices != 4 || regs.num_instances.NumInstances() != 1 ||
+        regs.blend_control[0].enable || bindings.sampled.size() != 2)
+        return false;
+    const auto y = ps->images[0].GetSharp(*ps);
+    const auto uv = ps->images[1].GetSharp(*ps);
+    if (y.width + 1 != 2 * (uv.width + 1) || y.height + 1 != 2 * (uv.height + 1))
+        return false;
+    VideoCore::ImageViewInfo view{regs.color_buffers[0]};
+    view.range.base.layer = 1;
+    view.range.extent.layers = 1;
+    const auto right = View(*target, view, ViewUse::Attachment);
+    if (!right)
+        return false;
+    auto state = targets.state;
+    state.color_attachments[0].image_view = right;
+    state.color_attachments[0].is_clear = false;
+    state.num_layers = 1;
+    BeginRendering(state);
+    return true;
+}
+
+// GT7 multiplies its adaptive current-frame weight by c[22] at zero motion.
+// The shader already fades that multiplier out as jitter-compensated velocity increases.
+vk::DescriptorBufferInfo NativeRenderer::XrTaaConstants(VAddr address, u64 alignment) {
+    static const float stationary_weight = [] {
+        const char* mode = std::getenv("SHADGT_OPENXR_TAA");
+        if (mode && std::string_view{mode} == "game") return 0.01f;
+        if (mode && std::string_view{mode} == "clear") return 1.0f;
+        return 0.5f;
+    }();
+    const auto extent = Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed);
+    const vk::DescriptorBufferInfo unbound{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+    if (!extent || stationary_weight == 0.01f)
+        return unbound;
+
+    std::array<float, 28> constants;
+    if (!Core::RytyMemory::GuardedCopy(constants.data(), reinterpret_cast<const void*>(address),
+                                       sizeof(constants)))
+        return unbound;
+    const float width = static_cast<float>(extent >> 32);
+    const float height = static_cast<float>(static_cast<u32>(extent));
+    if (constants[14] != 0.5f * width || constants[15] != -0.5f * height ||
+        constants[16] != width || constants[17] != height || constants[22] != 0.01f)
+        return unbound;
+
+    constants[22] = stationary_weight;
+    const auto [buffer, offset, mapped] = Allocate(sizeof(constants), alignment);
+    std::memcpy(mapped, constants.data(), sizeof(constants));
+    return {buffer, offset, sizeof(constants)};
+}
+
+void NativeRenderer::NoteXrEyeCopy(const GraphicsPipeline& pipeline, const Targets& targets,
+                                   const DrawBindings& b) {
+    const auto* output = targets.colors[0];
+    if (!output || output->info.size.width != 1920 || output->info.size.height != 1080 ||
+        b.sampled.size() != 1 || b.images.empty())
+        return;
+    const auto& stages = pipeline.GetStages();
+    const auto* ps = stages[u32(Shader::SwStage::Fragment)];
+    const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+    if (!ps || ps->pgm_hash != 0x4d8a5765 || !vs || vs->pgm_hash != 0x90d65fe4)
+        return;
+    const auto* source = b.sampled.front();
+    if (!source || !source->image || source->image->Desc().layers != 2 ||
+        Gt7XrCamera::PackExtent(source->info.size.width, source->info.size.height) != Gt7XrCamera::game_eye_extent.load())
+        return;
+    // Read the actual SRV selected for this draw. A partial pack, a reused flip slot,
+    // or additional drawing over the packed output must take the ordinary display path.
+    VideoCore::ImageViewInfo view;
+    {
+        std::scoped_lock lock{views_mutex};
+        const auto it = views.find(source);
+        if (it == views.end())
+            return;
+        const auto actual = b.images.front().imageView;
+        const auto record = std::ranges::find_if(it->second, [&](const ViewRecord& candidate) {
+            return candidate.use == ViewUse::Sampled && *candidate.view == actual;
+        });
+        if (record == it->second.end())
+            return;
+        view = record->info;
+    }
+    const u32 layer = view.range.base.layer;
+    if (layer >= 2 || view.range.extent.layers != 1 || view.range.base.level != 0 ||
+        view.format != vk::Format::eA2B10G10R10UnormPack32)
+        return;
+    view.type = AmdGpu::ImageType::Color2D;
+    const auto color = View(*source, view, ViewUse::Sampled);
+    if (!color)
+        return;
+    const auto source_version = source->write_version.load();
+    if (xr_copies.frame != frame || xr_copies.source != source || xr_copies.output != output ||
+        xr_copies.source_version != source_version || xr_copies.eyes[layer]) {
+        xr_copies = {output, source, source->info.guest_address, frame, source_version};
+    }
+    xr_copies.eyes[layer] = color;
+    xr_copies.output_version = output->write_version.load();
+}
+
+void NativeRenderer::GetXrEyeCopies(const Native::ImageEntry& output, Display& display) {
+    const auto copy = std::exchange(xr_copies, {});
+    if (copy.frame + 1 != frame || copy.output != &output || !copy.eyes[0] || !copy.eyes[1] ||
+        copy.eyes[0] == copy.eyes[1] || output.write_version.load() != copy.output_version)
+        return;
+    const auto* source = registry->FindExisting(copy.source_address, [&](const Native::ImageEntry& item) {
+        return &item == copy.source && item.write_version.load() == copy.source_version;
+    });
+    if (source) {
+        display.xr_movie = xr_movie.target == source && xr_movie.frame == copy.frame &&
+                           xr_movie.version == copy.source_version;
+        display.xr_eyes = copy.eyes;
+        display.xr_eye_size = vk::Extent2D{source->info.size.width, source->info.size.height};
+    }
+}
+#endif
 
 // DLSS-GT7-001 (temporal DLSS; see ryty_upscale.h): GT7's temporal
 // anti-aliasing pass in a race. Its pixel shader 0xcfa125dd reads the depth, the motion vectors
@@ -24855,6 +25155,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.temporal = inputs;
         }
     }
+#ifdef RYGT_OPENXR
+    if (Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) && OpenXrOutput::IsRunning())
+        GetXrEyeCopies(*entry, display);
+#endif
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     ReleaseUnusedWatches();

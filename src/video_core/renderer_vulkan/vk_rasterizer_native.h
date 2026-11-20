@@ -173,6 +173,11 @@ public:
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
+#ifdef RYGT_OPENXR
+        std::array<vk::ImageView, 2> xr_eyes{};
+        vk::Extent2D xr_eye_size{};
+        bool xr_movie{};
+#endif
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
                                        vk::Extent2D output_size);
@@ -422,6 +427,31 @@ private:
         ViewUse use;
         vk::UniqueImageView view;
     };
+
+#ifdef RYGT_OPENXR
+    // The two final eye-copy draws must refer to the same, still-current image.
+    static constexpr u64 XrStereoTaaShader = 0x286680a7;
+    vk::DescriptorBufferInfo XrTaaConstants(VAddr address, u64 alignment);
+    struct XrEyeCopies {
+        const Native::ImageEntry* output{};
+        const Native::ImageEntry* source{};
+        VAddr source_address{};
+        u64 frame{}, source_version{}, output_version{};
+        std::array<vk::ImageView, 2> eyes{};
+    } xr_copies;
+    struct {
+        const Native::ImageEntry* target{};
+        u64 frame{}, version{};
+    } xr_movie;
+    bool IsXrResultsSurround(const GraphicsPipeline& pipeline, const Targets& targets,
+                             const AmdGpu::Regs& regs, const DrawBindings& bindings);
+    void SetXrFadeProjection(const GraphicsPipeline& pipeline, const Targets& targets,
+                             const AmdGpu::Regs& regs, DrawBindings& bindings);
+    bool BindXrMovieRightEye(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const AmdGpu::Regs& regs, const DrawBindings& bindings);
+    void NoteXrEyeCopy(const GraphicsPipeline& pipeline, const Targets& targets, const DrawBindings& bindings);
+    void GetXrEyeCopies(const Native::ImageEntry& output, Display& display);
+#endif
 
     Native::MadeImage MakeImage(const VideoCore::ImageInfo& info, bool render_target);
 
