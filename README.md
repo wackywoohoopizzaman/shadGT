@@ -56,6 +56,8 @@ which the RyGT launcher sets from GT7's options (and its Advanced page, per game
   `SHADGT_FAST_FLIPS=0` restores presentation on vblank ticks. The explicit `=1` override is still
   available; other rendering modes and frame generation keep their previous default.
 
+For headset setup, build options and the stereo regression fixture, see [GT7 cockpit VR](documents/gt7-openxr.md).
+
 ## Build
 
 Clone with submodules. In a Visual Studio x64 developer environment with clang-cl, CMake,
