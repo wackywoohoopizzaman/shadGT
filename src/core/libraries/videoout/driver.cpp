@@ -21,6 +21,9 @@
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
 #endif
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_camera.h"
+#endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -504,7 +507,8 @@ u64 VideoOutDriver::AntiLagInput() {
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-                                bool is_eop, u64 anti_lag_frame) {
+                                bool is_eop, u64 anti_lag_frame,
+                                std::shared_ptr<const Vulkan::GameStereoFrame> xr_frame) {
     auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
     RyDiag::Timeline('R', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
@@ -519,24 +523,33 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
         }
+#ifdef RYGT_OPENXR
+        else {
+            // FEAT-SGT-052: claim the tagged cameras only after this direct flip is accepted.
+            xr_frame = Vulkan::Gt7XrCamera::Claim(index);
+        }
+#endif
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
-    if (!is_eop) anti_lag_frame = presenter->AntiLagInput();
 
     if (!is_eop) {
+        // PERF-210: on the game's thread, never the command thread
+        const u64 anti_lag_frame = presenter->AntiLagInput();
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame); });
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame, xr_frame.get());
+        });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame, xr_frame.get());
     }
 
     return true;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame) {
+                                        Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame,
+                                        const Vulkan::GameStereoFrame* xr_frame) {
 #ifndef NDEBUG
     if (trace.generation)
         Common::FrameQueueTrace::Prepare(trace);
@@ -548,7 +561,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& buffer = port->buffer_slots[index];
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
-        frame = presenter->PrepareFrame(group, buffer.address_left);
+        frame = presenter->PrepareFrame(group, buffer.address_left, xr_frame);
     }
 
     {

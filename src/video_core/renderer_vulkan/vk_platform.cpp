@@ -32,6 +32,10 @@
 #include <mach-o/dyld.h>
 #endif
 
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr.h"
+#endif
+
 namespace Vulkan {
 
 static const char* const VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
@@ -271,7 +275,7 @@ std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_c
 }
 
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
-                                  bool enable_crash_diagnostic) {
+                                  bool enable_crash_diagnostic, OpenXrOutput* headset) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
 #if defined(__APPLE__)
@@ -308,7 +312,12 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+#ifdef RYGT_OPENXR
+    if (headset) {
+        headset->AddInstanceExtensions(extensions);
+    }
+#endif
 
     // AMD-317: the driver and AMD Software see the game; the engine name is unchanged.
     const vk::ApplicationInfo application_info = {
