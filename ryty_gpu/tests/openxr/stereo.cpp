@@ -231,7 +231,18 @@ int main(int argc, char** argv) {
     };
     auto screen = texture(nullptr);
     Frame frame{w, h, *screen.view, false};
-    int pairs = 0;
+    const char* setting = std::getenv("SHADGT_OPENXR_MIRROR_EYE");
+    const std::string_view selected = setting ? setting : "left";
+    using Mode = OpenXrOutput::DesktopMirror;
+    const auto expected = selected == "right"  ? Mode::Right
+                          : selected == "both" ? Mode::Both
+                          : selected == "off"  ? Mode::Off
+                                               : Mode::Left;
+    if (xr->MirrorMode() != expected)
+        return 8;
+    int pairs = 0, mirrored_movies = 0;
+    std::array<int, 2> mirrored_projections{};
+    bool valid_mirror = true;
     for (int i = 0; i < 155 && xr->CanCapture(); ++i) {
         auto viewFrame = xr->BeginFrame();
         if (!viewFrame || i < 25) {
@@ -261,24 +272,48 @@ int main(int argc, char** argv) {
             o.close();
             std::filesystem::rename(dir / "request.tmp", dir / "screenshot_request.json");
         }
+        const auto mirror = [&](vk::CommandBuffer, const OpenXrOutput::MirrorImage& src) {
+            valid_mirror &= bool(src.view) &&
+                            src.layout == vk::ImageLayout::eShaderReadOnlyOptimal && !src.encoded &&
+                            src.packed_eye == -1;
+            if (src.fov) {
+                if (src.eye >= 2) {
+                    valid_mirror = false;
+                    return;
+                }
+                const auto& eye = viewFrame->views[src.eye].fov;
+                valid_mirror &=
+                    src.fov->angleLeft == eye.angleLeft && src.fov->angleRight == eye.angleRight;
+                ++mirrored_projections[src.eye];
+            } else {
+                valid_mirror &= i >= 140;
+                ++mirrored_movies;
+            }
+        };
         if (i >= 125) {
             // Only the native eye textures contain the test geometry.
             GameStereoFrame game{*viewFrame};
             OpenXrOutput::StereoImages native_eyes{
                 viewFrame->id, {*left.view, *right.view}, false, i >= 140};
-            xr->Present(s, frame, &native_eyes, &game, {w, h});
+            xr->Present(s, frame, &native_eyes, &game, {w, h}, mirror);
         } else if (i >= 110) {
             auto packed = texture(&viewFrame->views[0], &viewFrame->views[1]);
             Frame packedFrame{w * 2, h, *packed.view, false};
             GameStereoFrame game{*viewFrame};
-            xr->Present(s, packedFrame, nullptr, &game, {});
+            xr->Present(s, packedFrame, nullptr, &game, {}, mirror);
         } else {
-            xr->Present(s, frame, &pair, nullptr, {});
+            xr->Present(s, frame, &pair, nullptr, {}, mirror);
         }
         if (i < 80)
             ++pairs;
     }
-    const bool ok = xr->CanCapture() && OpenXrOutput::IsRunning() && pairs > 20;
+    bool ok = xr->CanCapture() && OpenXrOutput::IsRunning() && pairs > 20 && valid_mirror;
+    for (unsigned i = 0; i < 2; ++i) {
+        const bool wanted =
+            expected == Mode::Both || (i == 0 ? expected == Mode::Left : expected == Mode::Right);
+        ok &= wanted ? mirrored_projections[i] > 30 : mirrored_projections[i] == 0;
+    }
+    ok &= expected == Mode::Off ? mirrored_movies == 0 : mirrored_movies > 3;
     xr.reset();
     return ok && !OpenXrOutput::HasSession() && !OpenXrOutput::IsRunning() ? 0 : 6;
 }

@@ -160,6 +160,7 @@ XrView InterpolateView(const XrView& a, const XrView& b, float t) {
 
 struct EyeTarget {
     XrSwapchain chain{};
+    bool sampleable{};
     vk::Extent2D size{};
     std::vector<XrSwapchainImageVulkanKHR> images;
     std::vector<vk::UniqueImageView> views;
@@ -210,6 +211,7 @@ struct OpenXrOutput::State {
     std::atomic<bool> enabled{true};
     bool running{}, focused{}, seat_calibrated{}, hdr_reported{};
     bool spatial_upscale{};
+    DesktopMirror mirror_mode{DesktopMirror::Left};
 #ifdef RYGT_OPENXR
     std::unique_ptr<XrEyeEffects> effects;
     bool sample_on_draw{};
@@ -276,6 +278,8 @@ struct OpenXrOutput::State {
     bool Initialize();
     bool Bind(const Instance& graphics);
     bool MakePipeline();
+    void MirrorFinishedEye(vk::CommandBuffer cmd, unsigned eye_index, uint32_t index,
+                           const XrFovf* fov, const MirrorDraw& mirror);
     bool Poll();
     bool Center(XrTime time);
     void Draw(vk::CommandBuffer cmd, const EyeTarget& target, uint32_t index, vk::ImageView source,
@@ -291,6 +295,14 @@ std::unique_ptr<OpenXrOutput> OpenXrOutput::Create() {
         return {};
     auto s = std::make_unique<State>();
     const char* upscale = std::getenv("SHADGT_OPENXR_UPSCALER");
+    const char* mirror = std::getenv("SHADGT_OPENXR_MIRROR_EYE");
+    const std::string_view mode = mirror ? mirror : "";
+    if (mode == "right")
+        s->mirror_mode = DesktopMirror::Right;
+    if (mode == "both")
+        s->mirror_mode = DesktopMirror::Both;
+    if (mode == "off")
+        s->mirror_mode = DesktopMirror::Off;
     s->spatial_upscale =
         upscale && (std::string_view{upscale} == "fsr" || std::string_view{upscale} == "dlss");
     if (!s->Initialize())
@@ -404,6 +416,18 @@ void OpenXrOutput::Start(const Instance& graphics) {
         LOG_WARNING(Render_Vulkan, "OpenXR setup failed, continuing on desktop");
     }
 }
+OpenXrOutput::DesktopMirror OpenXrOutput::MirrorMode() const {
+    return state->mirror_mode;
+}
+
+bool OpenXrOutput::MirrorsEye(unsigned eye, bool movie) const {
+    const auto mode = MirrorMode();
+    if (mode == DesktopMirror::Off)
+        return false;
+    if (movie)
+        return eye == 0;
+    return mode == DesktopMirror::Both || eye == unsigned(mode == DesktopMirror::Right);
+}
 bool OpenXrOutput::CanCapture() const {
     return state->enabled.load(std::memory_order_relaxed);
 }
@@ -500,7 +524,18 @@ bool OpenXrOutput::State::Bind(const Instance& graphics) {
         sc.width = eye.size.width;
         sc.height = eye.size.height;
         sc.sampleCount = sc.faceCount = sc.arraySize = sc.mipCount = 1;
-        const auto created = xrCreateSwapchain(session, &sc, &eye.chain);
+        // The desktop samples a finished eye while the runtime image is still acquired.
+        // On runtimes without sampled swapchains it can use the app-owned eye source.
+        const bool sample_for_mirror = mirror_mode != DesktopMirror::Off;
+        if (sample_for_mirror)
+            sc.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        XrResult created = xrCreateSwapchain(session, &sc, &eye.chain);
+        eye.sampleable = sample_for_mirror && XR_SUCCEEDED(created);
+        if (sample_for_mirror && !eye.sampleable) {
+            LOG_INFO(Render_Vulkan, "OpenXR: using the game eye source for the desktop mirror");
+            sc.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            created = xrCreateSwapchain(session, &sc, &eye.chain);
+        }
         if (!Success(created, "create eye swapchain") ||
             !Success(xrEnumerateSwapchainImages(eye.chain, 0, &n, nullptr), "count eye images") ||
             !n)
@@ -757,6 +792,29 @@ void OpenXrOutput::State::Draw(vk::CommandBuffer cmd, const EyeTarget& eye, uint
     cmd.endRendering();
 }
 
+void OpenXrOutput::State::MirrorFinishedEye(vk::CommandBuffer cmd, unsigned eye_index,
+                                            uint32_t index, const XrFovf* fov,
+                                            const MirrorDraw& mirror) {
+    const auto& eye = eyes[eye_index];
+    vk::ImageMemoryBarrier2 barrier{.srcStageMask =
+                                        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                                    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                                    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = eye.images[index].image,
+                                    .subresourceRange = {Color, 0, 1, 0, 1}};
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    mirror(cmd, {*eye.views[index], barrier.newLayout, false, -1, fov, eye_index});
+    std::swap(barrier.srcStageMask, barrier.dstStageMask);
+    std::swap(barrier.srcAccessMask, barrier.dstAccessMask);
+    std::swap(barrier.oldLayout, barrier.newLayout);
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+}
+
 std::optional<OpenXrOutput::ViewFrame> OpenXrOutput::BeginFrame() {
     auto& s = *state;
 #ifdef RYGT_OPENXR
@@ -837,7 +895,8 @@ std::optional<OpenXrOutput::ViewFrame> OpenXrOutput::BeginFrame() {
 }
 
 void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const StereoImages* stereo,
-                           const GameStereoFrame* game, vk::Extent2D game_eye_size) {
+                           const GameStereoFrame* game, vk::Extent2D game_eye_size,
+                           const MirrorDraw& mirror) {
     auto& s = *state;
     // A projection must correspond to the prediction already supplied to its
     // producer.
@@ -916,6 +975,21 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
                                                view.pose, view.fov, sub};
                     } else {
                         quad.subImage = sub;
+                    }
+                }
+                for (unsigned i = 0; real_frame && mirror && (paired || movie) && i < needed; ++i) {
+                    if (!MirrorsEye(i, movie))
+                        continue;
+                    const auto& eye = s.eyes[i];
+                    const XrFovf* fov = movie ? nullptr : &views[i].fov;
+                    if (eye.sampleable) {
+                        s.MirrorFinishedEye(cmd, i, indices[i], fov, mirror);
+                    } else if (separate || game_eyes) {
+                        mirror(cmd,
+                               {images[i] ? images[i] : stereo->colors[i],
+                                vk::ImageLayout::eGeneral, stereo->display_encoded, -1, fov, i});
+                    } else {
+                        mirror(cmd, {{}, {}, false, static_cast<int>(i), fov, i});
                     }
                 }
                 // A released swapchain image must contain this submission's pixels.
@@ -1034,9 +1108,10 @@ void OpenXrOutput::Present(Scheduler& scheduler, const Frame& frame, const Stere
         } else if (game_eyes) {
             LOG_WARNING(
                 Render_Vulkan,
-                "OpenXR: native eye images {}x{} to {}x{} per eye",
+                "OpenXR: native eye images {}x{} to {}x{} per eye, {} desktop mirror",
                 game_eye_size.width, game_eye_size.height, s.eyes[0].size.width,
-                s.eyes[0].size.height);
+                s.eyes[0].size.height,
+                std::array{"left-eye", "right-eye", "side-by-side", "off"}[size_t(s.mirror_mode)]);
         } else {
             LOG_INFO(Render_Vulkan, "OpenXR: {}", paired ? "native stereo" : "virtual screen");
         }

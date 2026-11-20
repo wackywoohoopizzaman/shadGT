@@ -47,6 +47,7 @@ struct Frame {
     u64 ready_tick;
     Scheduler* ready_scheduler{}; // PERF-084: submits the work signaling ready_tick
     bool is_hdr{false};
+    bool suppress_desktop{};
     u8 id{};
 
 #ifdef RYTY_GPU
@@ -181,6 +182,7 @@ private:
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame{};
+    bool desktop_blanked{};
 
 public:
     /// True once a frame has been shown (it can be shown again).
