@@ -13,6 +13,10 @@
 
 #include "common/logging/log.h"
 #include "common/game_title.h"
+#include "ryty_gpu/ryty_upscale_quality.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr.h"
+#endif
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -29,51 +33,6 @@ bool UpscaleRequested(); // ryty_dlssg.h: GPU.dlss_enabled and Streamline's DLSS
 } // namespace Vulkan::RytyDlssG
 
 namespace Vulkan::RytyUpscale {
-
-enum class Quality { Auto, Native, Quality, Balanced, Performance, UltraPerformance };
-
-inline Quality GetQuality() {
-    static const Quality quality = [] {
-        const char* env = std::getenv("SHADGT_UPSCALE_QUALITY");
-        if (!env) {
-            return Quality::Auto;
-        }
-        if (std::strcmp(env, "native") == 0) {
-            return Quality::Native;
-        }
-        if (std::strcmp(env, "quality") == 0) {
-            return Quality::Quality;
-        }
-        if (std::strcmp(env, "balanced") == 0) {
-            return Quality::Balanced;
-        }
-        if (std::strcmp(env, "performance") == 0) {
-            return Quality::Performance;
-        }
-        if (std::strcmp(env, "ultra_performance") == 0) {
-            return Quality::UltraPerformance;
-        }
-        return Quality::Auto;
-    }();
-    return quality;
-}
-
-inline double Scale(Quality quality) {
-    switch (quality) {
-    case Quality::Native:
-        return 1.0;
-    case Quality::Quality:
-        return 1.5;
-    case Quality::Balanced:
-        return 1.0 / 0.58;
-    case Quality::Performance:
-        return 2.0;
-    case Quality::UltraPerformance:
-        return 3.0;
-    default:
-        return 0.0;
-    }
-}
 
 /// The upscaler's output size for the game picture input shown in window.
 inline vk::Extent2D Target(vk::Extent2D input, vk::Extent2D window) {
@@ -185,6 +144,11 @@ inline bool TemporalKeys() {
 /// called while drawing, after the game's parameters are read (sceKernelIsNeoMode keeps its
 /// first answer).
 inline bool TemporalRequested() {
+#ifdef RYGT_OPENXR
+    // The headset path supplies its own scene color, jitter, depth and motion per eye.
+    if (OpenXrOutput::IsRunning())
+        return false;
+#endif
     static const bool on = [] {
         // GT7 only: GT Sport's temporal reconstruction is its own, in the frame (GtsDlssPass,
         // RytyDlss::TemporalRequested).
@@ -302,7 +266,13 @@ inline std::atomic<float>& TemporalMipBias() {
     return bias;
 }
 
-/// Called by the presenter's DLSS pass after a frame scaled with the temporal inputs.
+inline float DlssMaterialMipBias(vk::Extent2D render, vk::Extent2D display, float extra) {
+    if (render.width == 0 || display.width <= render.width)
+        return 0.0f;
+    return std::log2(static_cast<float>(render.width) / static_cast<float>(display.width)) + extra;
+}
+
+/// Called by the desktop DLSS pass after a frame scaled with the temporal inputs.
 inline void NoteTemporalScale(vk::Extent2D render, vk::Extent2D display) {
     static const bool wanted = [] {
         const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_MIP_BIAS");
@@ -314,12 +284,11 @@ inline void NoteTemporalScale(vk::Extent2D render, vk::Extent2D display) {
         return std::isfinite(value) ? std::clamp(value, -2.0f, 0.0f) : -1.0f;
     }();
     auto& bias = TemporalMipBias();
-    if (!wanted || render.width == 0 || display.width <= render.width ||
-        bias.load(std::memory_order_relaxed) != 0.0f) {
+    if (!wanted || bias.load(std::memory_order_relaxed) != 0.0f)
         return;
-    }
-    const float value =
-        std::log2(static_cast<float>(render.width) / static_cast<float>(display.width)) + extra;
+    const float value = DlssMaterialMipBias(render, display, extra);
+    if (value == 0.0f)
+        return;
     bias.store(value, std::memory_order_relaxed);
     LOG_WARNING(Render_Vulkan,
                 "DLSS-GT7-002: texture bias {:.2f} on the material samplers from now on "

@@ -15,6 +15,9 @@
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/rygt_dlss_api.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr_effects.h"
+#endif
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 namespace Vulkan::RytyDlss {
@@ -33,11 +36,23 @@ struct Plugin {
     PFN_RygtDlss_TemporalApiVersion temporal_version{};
     PFN_RygtDlss_GetOptimalSettings optimal_settings{};
     PFN_RygtDlss_EvaluateTemporal evaluate_temporal{};
+#ifdef RYGT_OPENXR
+    PFN_RygtDlss_GenerateEye generate_eye{};
+    PFN_RygtDlss_GenerateEyeIndexed generate_indexed{};
+#endif
     bool tried{};
     bool ready{}; // Init succeeded
 };
 // Upscaling through Streamline's sl.dlss.dll (ryty_dlssg.cpp) instead of the plugin.
 bool g_streamline{};
+bool XrGeneratorRequested() {
+#ifdef RYGT_OPENXR
+    const char *vr = std::getenv("SHARED_OPENXR"), *mode = std::getenv("SHARED_OPENXR_FRAMEGEN");
+    return vr && std::string_view{vr} == "1" && mode && std::string_view{mode} == "dlss";
+#else
+    return false;
+#endif
+}
 Plugin g_plugin;
 
 std::string LastError() {
@@ -84,10 +99,10 @@ bool Load() {
         return g_plugin.module != nullptr;
     }
     g_plugin.tried = true;
-    if (!EmulatorSettings.IsDlssEnabled()) {
+    if (!EmulatorSettings.IsDlssEnabled() && !XrGeneratorRequested()) {
         return false;
     }
-    if (RytyDlssG::UpscaleRequested()) {
+    if (RytyDlssG::UpscaleRequested() && !XrGeneratorRequested()) {
         // NVIDIA's own sl.dlss.dll is in the dlss folder: upscale through Streamline.
         return false;
     }
@@ -125,6 +140,10 @@ bool Load() {
     LOAD(temporal_version, "RygtDlss_TemporalApiVersion");
     LOAD(optimal_settings, "RygtDlss_GetOptimalSettings");
     LOAD(evaluate_temporal, "RygtDlss_EvaluateTemporal");
+#ifdef RYGT_OPENXR
+    LOAD(generate_eye, "RygtDlss_GenerateEye");
+    LOAD(generate_indexed, "RygtDlss_GenerateEyeIndexed");
+#endif
 #undef LOAD
     if (!g_plugin.get_instance_extensions || !g_plugin.get_device_extensions || !g_plugin.init ||
         !g_plugin.supports || !g_plugin.evaluate || !g_plugin.shutdown || !g_plugin.last_error) {
@@ -188,18 +207,17 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device 
     if (g_plugin.ready || g_streamline) {
         return true;
     }
-    if (RytyDlssG::InitUpscale()) {
-        g_streamline = true;
+    g_streamline = RytyDlssG::InitUpscale();
+    if (g_streamline && !XrGeneratorRequested())
         return true;
-    }
     if (!g_plugin.module) {
-        return false;
+        return g_streamline;
     }
     if (g_plugin.init(instance, physical_device, device,
                       VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
                       VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, nullptr) != 0) {
         LOG_WARNING(Render_Vulkan, "ryGT DLSS: {}; using FSR", LastError());
-        return false;
+        return g_streamline;
     }
     g_plugin.ready = true;
     LOG_INFO(Render_Vulkan, "ryGT DLSS: ready");
@@ -322,7 +340,8 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
     auto& temporal_usable = RytyUpscale::TemporalUsable();
     // GT Sport: with the plugin's temporal interface asked for (TemporalRequested, never on
     // GT7), the reconstruction is done in the frame (GtsDlssPass) and this pass scales nothing.
-    if ((!g_plugin.ready && !g_streamline) || failed || (!g_streamline && TemporalRequested())) {
+    if (!EmulatorSettings.IsDlssEnabled() || (!g_plugin.ready && !g_streamline) || failed ||
+        (!g_streamline && TemporalRequested())) {
         temporal_usable.store(false, std::memory_order_relaxed);
         return input;
     }
@@ -463,3 +482,38 @@ void Pass::CreateImages(Img& img) const {
 }
 
 } // namespace Vulkan::RytyDlss
+#ifdef RYGT_OPENXR
+namespace Vulkan::XrVendor {
+bool GenerateDlss(vk::CommandBuffer cmd, const XrEffectFrame& f, unsigned eye, const XrView& view,
+                  unsigned count, unsigned index) {
+    using namespace RytyDlss;
+    if (!g_plugin.ready || (!g_plugin.generate_indexed && !g_plugin.generate_eye)) {
+        LOG_WARNING(Render_Vulkan, "OpenXR: NGX eye generator plugin unavailable");
+        return false;
+    }
+    const auto image = [](const XrEffectImage& i) -> RygtDlssImage {
+        return {i.image, i.view, VkFormat(i.format), i.size.width, i.size.height};
+    };
+    const auto& p = view.pose.position;
+    const auto& q = view.pose.orientation;
+    const auto& v = view.fov;
+    RygtDlssEyeFrame args{
+        image(f.color),
+        image(f.depth),
+        image(f.motion),
+        image(f.generated),
+        {p.x, p.y, p.z},
+        {q.x, q.y, q.z, q.w},
+        {std::tan(v.angleLeft), std::tan(v.angleRight), std::tan(v.angleUp), std::tan(v.angleDown)},
+        eye,
+        unsigned(f.reset)};
+    const int result = g_plugin.generate_indexed
+                           ? g_plugin.generate_indexed(cmd, &args, count, index)
+                           : g_plugin.generate_eye(cmd, &args);
+    if (result == 0)
+        return true;
+    LOG_WARNING(Render_Vulkan, "OpenXR: DLSS frame generation eye {} failed: {}", eye, LastError());
+    return false;
+}
+} // namespace Vulkan::XrVendor
+#endif
