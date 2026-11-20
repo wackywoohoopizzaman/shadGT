@@ -1472,6 +1472,7 @@ add_compile_definitions(BOOST_ASIO_STANDALONE)
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Shaders sources
+option(RYGT_BUILD_OPENXR "Build optional OpenXR output for the Ryty renderer" OFF)
 set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders)
 
 add_subdirectory(${HOST_SHADERS_INCLUDE})
