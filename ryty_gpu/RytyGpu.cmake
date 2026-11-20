@@ -166,6 +166,12 @@ ryty_add_library(ryty_gpu libSceVideoOut
 if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
     set_source_files_properties(ryty_gpu/native/native_xxh512.c PROPERTIES COMPILE_OPTIONS "-march=x86-64")
 endif()
+if (RYGT_BUILD_OPENXR)
+    find_package(OpenXR CONFIG REQUIRED)
+    add_executable(rygt_openxr_info ryty_gpu/tools/openxr_info.cpp ryty_gpu/openxr_system.cpp)
+    target_link_libraries(rygt_openxr_info PRIVATE Vulkan::Headers OpenXR::openxr_loader)
+endif()
+
 # RYTY_DIAG: this library holds the stutter diagnostics (ryty_diag.h), when the build has them.
 target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1
     $<${SHADGT_DIAGNOSTICS_ON}:RYTY_DIAG=1>)
