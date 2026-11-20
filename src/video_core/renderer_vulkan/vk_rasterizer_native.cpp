@@ -144,6 +144,7 @@
 #include "ryty_gpu/native/slow_call_trace.h"
 #ifdef RYGT_OPENXR
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_openxr_effects.h"
 #endif
 #include "video_core/renderer_vulkan/kept_shadow_map.h"
 #include "ryty_gpu/native/job_walker.h"
@@ -2931,7 +2932,9 @@ std::shared_ptr<NativeRenderer::TemporalScratchImage> NativeRenderer::MakeHudPic
         .newLayout = vk::ImageLayout::eGeneral,
         .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
         .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .aspectMask = entry->info.props.is_depth
+                ? vk::ImageAspectFlagBits::eDepth | (entry->info.props.has_stencil ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlags{})
+                : vk::ImageAspectFlagBits::eColor,
             .baseMipLevel = 0,
             .levelCount = VK_REMAINING_MIP_LEVELS,
             .baseArrayLayer = 0,
@@ -3317,7 +3320,13 @@ static float TemporalSamplerBias(const AmdGpu::Sampler& sampler, bool is_depth,
     if (!Common::IsGt7()) {
         return 0.0f; // Merge (shadGT): GT7's temporal path only
     }
-    const float bias = RytyUpscale::TemporalMipBias().load(std::memory_order_relaxed);
+    const auto& active_bias =
+#ifdef RYGT_OPENXR
+        Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) && OpenXrOutput::IsRunning()
+            ? Gt7XrCamera::dlss_material_mip_bias :
+#endif
+        RytyUpscale::TemporalMipBias();
+    const float bias = active_bias.load(std::memory_order_relaxed);
     if (bias == 0.0f || is_depth) {
         return 0.0f;
     }
@@ -11784,7 +11793,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 #ifdef RYGT_OPENXR
             if (stage.pgm_hash == XrStereoTaaShader && stage.sw_stage == Shader::SwStage::Fragment &&
                 bindable && !desc.is_written && sharp_size == 28 * sizeof(float) &&
-                size == sharp_size && Gt7XrCamera::Requested() && OpenXrOutput::IsRunning()) {
+                size == sharp_size && Gt7XrCamera::Requested() && OpenXrOutput::IsRunning() &&
+                !Gt7XrCamera::reconstruction_extent.load(std::memory_order_relaxed)) {
                 info = XrTaaConstants(base, alignment);
             }
 #endif
@@ -15710,6 +15720,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const auto& cb0 = r.liverpool->DrawRegs().color_buffers[0];
         temporal.display_draw_now = cb0 && IsDisplayAddress(cb0.Address());
     }
+#ifdef RYGT_OPENXR
+    if (Gt7XrCamera::game_eye_extent.load(std::memory_order_relaxed) && OpenXrOutput::IsRunning() &&
+        xr_post.frame == frame && xr_post.final && xr_post.display && !xr_post.incomplete) {
+        const auto& cb = r.liverpool->DrawRegs().color_buffers[0];
+        temporal.display_draw_now |= cb && cb.Address() == xr_post.final->info.guest_address;
+    }
+#endif
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
@@ -16612,10 +16629,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                              OpenXrOutput::IsRunning();
     const bool xr_results_surround =
         has_xr_eyes && IsXrResultsSurround(*pipeline, targets, regs, b);
+    const bool xr_current_sample = has_xr_eyes && UseXrCurrentSample(*pipeline, targets, b);
     // Draws that change descriptors, replay a layer, or skip a stereo surround must run
     // where the render state is owned. Ordinary scene draws remain eligible for workers.
     const bool serial_xr_draw = has_xr_eyes &&
-        (xr_results_surround || (composition_fs && composition_fs->pgm_hash == 0xf3fc7237));
+        (xr_results_surround || xr_current_sample || (composition_fs && composition_fs->pgm_hash == 0xf3fc7237) ||
+         (xr_post.frame == frame && xr_post.hdr && !xr_post.incomplete));
     bool drew_xr_movie = false;
     if (has_xr_eyes)
         SetXrFadeProjection(*pipeline, targets, regs, b);
@@ -16682,7 +16701,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         hud_batched = !reads_display;
     }
-    if (temporal.hud_batch_open && !hud_batched) {
+    bool batch_eye_overlay = false;
+#ifdef RYGT_OPENXR
+    // Independent color-only overlays can stay in the output-resolution pass while the
+    // original draws run in the game pass. A reader of either target closes the batch.
+    batch_eye_overlay = has_xr_eyes && xr_post.frame == frame && xr_post.display && !xr_post.incomplete &&
+        targets.colors[0] == xr_post.final && targets.state.num_color_attachments == 1 &&
+        !targets.depth && !indirect && !regs.stage_enable.hs_en && !s.wrapped_list &&
+        !hud_black_state && !hud_white_state && !hud_batched && !b.writes_buffers &&
+        b.stored.empty() && b.gpu_writes.empty() &&
+        std::ranges::find(b.sampled, xr_post.final) == b.sampled.end() &&
+        std::ranges::find(b.sampled, xr_post.resolved) == b.sampled.end();
+#endif
+    if (temporal.hud_batch_open && !hud_batched && !batch_eye_overlay) {
         CloseHudBatch();
         Begin();
     }
@@ -18305,6 +18336,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if(!parallel_draw) BeginRendering(hud_black_state ? *hud_black_state : targets.state); // GT7-UW
     }
 
+#ifdef RYGT_OPENXR
+    bool xr_post_draw = false;
+#endif
     // DLSS-GT7-001 (GT7's temporal path; nothing elsewhere: the scale stays 1 and no shift is
     // asked for): the viewports and scissors of a record into the HUD's larger pictures, and of a
     // menu's interface drawn shifted by the frame's jitter. After UpdateViewportScissorState.
@@ -18329,6 +18363,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             s.dynamic.SetScissors(scissors);
         }
+#ifdef RYGT_OPENXR
+        if (xr_post_draw) {
+            const auto size = targets.colors[0]->info.size;
+            const float x = float(xr_post.output.width) / size.width;
+            const float y = float(xr_post.output.height) / size.height;
+            auto viewports = s.dynamic.viewports;
+            for (auto& vp : viewports) {
+                vp.x *= x;
+                vp.y *= y;
+                vp.width *= x;
+                vp.height *= y;
+            }
+            s.dynamic.SetViewports(viewports);
+            auto scissors = s.dynamic.scissors;
+            for (auto& sc : scissors) {
+                const s32 right = std::lround((sc.offset.x + s64(sc.extent.width)) * x);
+                const s32 bottom = std::lround((sc.offset.y + s64(sc.extent.height)) * y);
+                sc.offset.x = std::lround(sc.offset.x * x);
+                sc.offset.y = std::lround(sc.offset.y * y);
+                sc.extent = vk::Extent2D{u32(right - sc.offset.x), u32(bottom - sc.offset.y)};
+            }
+            s.dynamic.SetScissors(scissors);
+        }
+#endif
         if (jitter_shift) {
             // Drawn where the jittered scene under it is (temporal.jitter: the scene's shift in
             // pixels, x right, y down).
@@ -18512,7 +18570,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 NATIVE_DIAGNOSTIC(++parallel->missing_sets);NATIVE_DIAGNOSTIC(++stats.skipped);
                 return;
             }
-        } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        } else {
+#ifdef RYGT_OPENXR
+        if (xr_current_sample) {
+            DrainBinder();
+            const auto saved_view = std::exchange(b.images[0].imageView,
+                vk::ImageView{Handle<VkImageView_T>(xr_invalid_motion_view->NativeHandle())});
+            const auto saved_sampler = std::exchange(b.images[3].sampler,
+                vk::Sampler{Handle<VkSampler_T>(xr_invalid_motion_sampler->NativeHandle())});
+            // Prepared keys can refresh buffers in place. A different image or sampler
+            // requires a complete key on both the temporary bind and its restoration.
+            b.key_layout = nullptr;
+            PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+            DrainBinder();
+            b.images[0].imageView = saved_view;
+            b.images[3].sampler = saved_sampler;
+            b.key_layout = nullptr;
+        } else
+#endif
+        {
+            PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        }
+        }
         if (one_off_observer && one_off_observer->HasWatches()) {
             const auto outputs = GetOneOffOutputs(regs);
             for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Redrawn(outputs.keys[i]);
@@ -19043,6 +19122,42 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             record_wide_draw(); // WIDE-008/031/060
 #ifdef RYGT_OPENXR
+            if (has_xr_eyes && xr_post.frame == frame && xr_post.hdr && !xr_post.incomplete && targets.colors[0] &&
+                (targets.colors[0] == xr_post.resolved || targets.colors[0] == xr_post.final ||
+                 (targets.colors[0]->info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+                  std::ranges::find(b.sampled, xr_post.resolved) != b.sampled.end()))) {
+                // Prepared bindings may be reused by the command thread. Restore the exact SRVs.
+                DrainBinder();
+                decltype(b.images) original_images;
+                if (std::ranges::find(b.sampled, xr_post.resolved) != b.sampled.end())
+                    original_images = b.images;
+                if (auto post = XrPostDraw(*pipeline, targets, regs, b)) {
+                    if (batch_eye_overlay) {
+                        DrainBinder();
+                        std::swap(Ctx().stream, Ctx().hud_stream);
+                        BeginHudStream();
+                    }
+                    BeginRendering(*post);
+                    xr_post_draw = true;
+                    bind_state();
+                    record_draw();
+                    xr_post_draw = false;
+                    if (batch_eye_overlay) {
+                        DrainBinder();
+                        std::swap(Ctx().stream, Ctx().hud_stream);
+                        temporal.hud_batch_open = true;
+                        ++temporal.batched_draws;
+                    }
+                } else if (targets.colors[0] == xr_post.final || targets.colors[0] == xr_post.resolved) {
+                    // A partial companion can omit an overlay or carry an old eye at the flip.
+                    xr_post.incomplete = true;
+                }
+                if (!original_images.empty()) {
+                    DrainBinder();
+                    std::copy(original_images.begin(), original_images.end(), b.images.begin());
+                    b.key_layout = nullptr;
+                }
+            }
             if (has_xr_eyes && BindXrMovieRightEye(*pipeline, targets, regs, b)) {
                 bind_state();
                 record_draw();
@@ -19129,6 +19244,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if (drew_xr_movie)
             xr_movie = {targets.colors[0], frame, targets.colors[0]->write_version.load()};
         if (has_xr_eyes) {
+            static const bool process_eyes = [] {
+                const char* sr = std::getenv("SHADGT_OPENXR_UPSCALER");
+                return sr && (std::string_view{sr} == "dlss" || std::string_view{sr} == "fsr");
+            }();
+            if (process_eyes)
+                NoteXrScene(*pipeline, targets, b);
             NoteXrEyeCopy(*pipeline, targets, b);
         }
 #endif
@@ -19504,6 +19625,315 @@ vk::DescriptorBufferInfo NativeRenderer::XrTaaConstants(VAddr address, u64 align
     return {buffer, offset, sizeof(constants)};
 }
 
+const std::shared_ptr<NativeRenderer::TemporalScratchImage>& NativeRenderer::XrPostImage(
+    const Native::ImageEntry& like, vk::Extent2D size, VAddr key) {
+    auto& image = xr_post.images[key];
+    TemporalPicture(image, like, size);
+    return image;
+}
+
+static void BlitXrLayer(vk::CommandBuffer cmd, vk::Image src, vk::Extent2D in, u32 src_layer,
+                        vk::Image dst, vk::Extent2D out, u32 dst_layer,
+                        vk::ImageAspectFlagBits aspect, vk::Filter filter) {
+    vk::ImageBlit region{};
+    region.srcSubresource = {aspect, 0, src_layer, 1};
+    region.dstSubresource = {aspect, 0, dst_layer, 1};
+    region.srcOffsets[1] = vk::Offset3D{s32(in.width), s32(in.height), 1};
+    region.dstOffsets[1] = vk::Offset3D{s32(out.width), s32(out.height), 1};
+    cmd.blitImage(src, vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, region, filter);
+}
+
+// The stereo resolve shader writes HDR scene color and a separately encoded history.
+// A motion sample below -1000 selects GT7's existing current-color branch, which
+// writes both targets without sampling history or accumulating neighboring pixels.
+bool NativeRenderer::UseXrCurrentSample(const GraphicsPipeline& pipeline, const Targets& t,
+                                        const DrawBindings& b) {
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || fs->pgm_hash != XrStereoTaaShader || !frame ||
+        xr_reconstructed_frame.load(std::memory_order_acquire) != frame - 1 ||
+        !Gt7XrCamera::reconstruction_extent.load(std::memory_order_relaxed) ||
+        xr_scene.frame != frame || !xr_scene.motion || !xr_scene.color ||
+        t.state.num_color_attachments != 2 || !t.colors[0] || !t.colors[1] ||
+        t.colors[0]->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+        !t.colors[1]->image || t.colors[1]->image->Desc().layers != 2 ||
+        t.colors[1]->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
+        fs->images.size() != 3 || fs->samplers.size() != 3 ||
+        b.images.size() != 6 || b.sampled.size() != 3 ||
+        b.sampled[0] != xr_scene.motion || b.sampled[1] != xr_scene.color ||
+        !b.images[0].imageView || !b.images[3].sampler)
+        return false;
+    if (xr_invalid_motion_sampler)
+        return true;
+    auto image = device->CreateImage({
+        .dim = Native::Rhi::ImageDim::D2,
+        .format = Native::Rhi::FormatFromVk(VK_FORMAT_R16G16_SFLOAT),
+        .width = 1, .height = 1, .layers = 1, .mips = 1,
+        .usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst,
+        .name = "XR current-sample resolve"});
+    if (!image)
+        return false;
+    auto view = device->CreateImageView(image.get(), {.dim = Native::Rhi::ViewDim::D2});
+    const auto edge = Native::Rhi::AddressMode::ClampToEdge;
+    const auto nearest = Native::Rhi::Filter::Nearest;
+    auto sampler = device->CreateSampler({.min_filter = nearest, .mag_filter = nearest,
+        .mip_filter = nearest, .address = {edge, edge, edge}, .max_lod = 0.f});
+    if (!view || !sampler)
+        return false;
+    auto& s = Begin();
+    EndRendering();
+    device->RecordPendingImageInit(*s.list);
+    s.cmd.clearColorImage(vk::Image{Handle<VkImage_T>(image->NativeHandle())},
+        vk::ImageLayout::eGeneral, vk::ClearColorValue{std::array{-65504.f, 0.f, 0.f, 0.f}},
+        vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+    GlobalBarrier();
+    xr_invalid_motion = std::move(image);
+    xr_invalid_motion_view = std::move(view);
+    xr_invalid_motion_sampler = std::move(sampler);
+    return true;
+}
+
+void NativeRenderer::ReconstructXrScene(const Targets& t) {
+    const auto* result = t.colors[1];
+    if (!result || !result->image || result == xr_scene.color ||
+        result->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
+        result->image->Desc().layers != 2 || xr_scene.color->image->Desc().layers != 2)
+        return;
+    const auto& size = result->info.size;
+    const vk::Extent2D input{size.width, size.height};
+    if (input.width != xr_scene.color->info.size.width || input.height != xr_scene.color->info.size.height)
+        return;
+    if (xr_post.frame != frame || xr_post.resolved != result) {
+        xr_post.frame = frame;
+        xr_post.resolved = result;
+        xr_post.eyes_seen = xr_post.toned_eyes = 0;
+        xr_post.incomplete = false;
+        xr_post.final = nullptr;
+        xr_post.hdr = xr_post.display = nullptr;
+        xr_post.depth_copied = false;
+    }
+    const auto layer = t.color_ranges[1].layer;
+    if (layer >= 2 || xr_post.eyes_seen == 3)
+        return;
+    xr_post.eyes_seen |= 1u << layer;
+    if (xr_post.eyes_seen != 3 || xr_scene.confirmed_eyes != 3)
+        return;
+
+    const u64 packed = Gt7XrCamera::reconstruction_extent.load(std::memory_order_relaxed);
+    const vk::Extent2D output{u32(packed >> 32), u32(packed)};
+    const auto cameras = Gt7XrCamera::Read();
+    using FF = vk::FormatFeatureFlagBits2;
+    const auto game_format = static_cast<vk::Format>(result->image->Desc().format);
+    if (!cameras || input.width > output.width || input.height > output.height ||
+        !r.instance.IsFormatSupported(vk::Format::eR16G16B16A16Sfloat, FF::eBlitSrc | FF::eSampledImageFilterLinear) ||
+        !r.instance.IsFormatSupported(game_format, FF::eBlitDst) ||
+        (input != output && !r.instance.IsFormatSupported(game_format, FF::eBlitSrc | FF::eSampledImageFilterLinear)))
+        return;
+    OpenXrOutput::StereoImages images{};
+    images.motion_scale = xr_scene.scale;
+    VideoCore::ImageViewInfo v{};
+    v.range.extent.levels = v.range.extent.layers = 1;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        v.range.base.layer = eye;
+        v.format = xr_scene.color->info.pixel_format;
+        images.colors[eye] = View(*xr_scene.color, v, ViewUse::Sampled);
+        v.format = vk::Format::eR32Sfloat;
+        images.depth[eye] = View(*xr_scene.depth, v, ViewUse::Sampled);
+        v.format = vk::Format::eR16G16Sfloat;
+        images.motion[eye] = View(*xr_scene.motion, v, ViewUse::Sampled);
+        if (!images.colors[eye] || !images.depth[eye] || !images.motion[eye])
+            return;
+    }
+    xr_post.output = output;
+    if (input != output) {
+        xr_post.hdr = XrPostImage(*result, output, 0);
+        if (!xr_post.hdr)
+            return;
+    }
+    // FEAT-SGT-077: keep the provider resources alive across native command-ring replay and GPU execution.
+    const auto key = std::pair{Gt7XrCamera::PackExtent(input.width, input.height), packed};
+    auto& owner = xr_post.effects[key];
+    if (!owner)
+        owner = std::make_unique<XrEyeEffects>(r.instance, XrEyeEffects::Stage::Scene);
+    auto* effects = owner.get();
+    const vk::Image game{Handle<VkImage_T>(result->image->NativeHandle())};
+    const vk::Image high = xr_post.hdr ? vk::Image{Handle<VkImage_T>(xr_post.hdr->image->NativeHandle())} : vk::Image{};
+    const auto now = std::chrono::steady_clock::now();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - xr_post.last_time).count();
+    const s64 interval = xr_post.last_scene + 1 == frame && xr_post.origin == cameras->origin &&
+                         ns > 0 && ns < 100'000'000 ? ns : 0;
+    xr_post.last_scene = frame;
+    xr_post.last_time = now;
+    xr_post.origin = cameras->origin;
+    GlobalBarrier();
+    Ctx().stream.cmd.Run([this, effects, images, camera = *cameras, input, output, interval, game, high,
+                    scene_frame = frame](vk::CommandBuffer cmd) {
+        auto pair = effects->Process(cmd, images, camera, input, {output, output}, interval);
+        xr_reconstructed_frame.store(pair.reconstructed[0] && pair.reconstructed[1] ? scene_frame : ~u64{0},
+                                     std::memory_order_release);
+        const vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+        for (u32 i = 0; i < 2; ++i) {
+            const auto hdr = pair.reconstructed[i];
+            constexpr auto color = vk::ImageAspectFlagBits::eColor;
+            // The guest-sized result is consumed by exposure and bloom. Preserve a full-size
+            // copy for later scene draws and tone mapping. A missing provider uses the guest resolve.
+            if (hdr)
+                BlitXrLayer(cmd, hdr, output, 0, game, input, i, color, vk::Filter::eLinear);
+            if (high)
+                BlitXrLayer(cmd, hdr ? hdr : game, hdr ? output : input, hdr ? 0 : i,
+                            high, output, i, color, vk::Filter::eLinear);
+        }
+    });
+    GlobalBarrier();
+    DrainBinder();
+    auto& stream = Ctx().stream;
+    stream.pipelines.Invalidate();
+    ForgetBindings(stream);
+}
+
+std::optional<RenderState> NativeRenderer::XrPostDraw(const GraphicsPipeline& pipeline,
+        const Targets& t, const AmdGpu::Regs& regs, DrawBindings& b) {
+    const auto* target = t.colors[0];
+    if (t.state.num_color_attachments != 1 || !target->image || target->image->Desc().layers != 2 ||
+        t.state.width != xr_post.resolved->info.size.width ||
+        t.state.height != xr_post.resolved->info.size.height)
+        return {};
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (target != xr_post.resolved && target != xr_post.final) {
+        if (!ps || ps->images.empty() || b.sampled.empty() || b.sampled.front() != xr_post.resolved)
+            return {};
+        xr_post.display = XrPostImage(*target, xr_post.output, target->info.guest_address);
+        xr_post.final = target;
+        xr_post.toned_eyes = 0;
+    }
+    const auto& large = target == xr_post.resolved ? xr_post.hdr : xr_post.display;
+    if (!large)
+        return {};
+    auto state = t.state;
+    const auto out = View(*large, VideoCore::ImageViewInfo{regs.color_buffers[0]}, ViewUse::Attachment);
+    if (!out)
+        return {};
+    state.color_attachments[0].image_view = out;
+    state.width = xr_post.output.width;
+    state.height = xr_post.output.height;
+    if (t.depth) {
+        const auto depth_format = static_cast<vk::Format>(t.depth->image->Desc().format);
+        if (t.depth != xr_scene.depth || t.depth->image->Desc().layers != 2 ||
+            !r.instance.IsFormatSupported(depth_format, vk::FormatFeatureFlagBits2::eBlitSrc |
+                                                       vk::FormatFeatureFlagBits2::eBlitDst))
+            return {};
+        const auto& depth = XrPostImage(*t.depth, xr_post.output, 1);
+        if (!depth)
+            return {};
+        const VideoCore::ImageViewInfo dv{regs.depth_buffer, regs.depth_view, regs.depth_control};
+        const auto view = View(*depth, dv, ViewUse::Attachment);
+        if (!view)
+            return {};
+        state.depth_stencil_attachment.image_view = view;
+        if (!xr_post.depth_copied) {
+            GlobalBarrier();
+            const vk::Image src{Handle<VkImage_T>(t.depth->image->NativeHandle())};
+            const vk::Image dst{Handle<VkImage_T>(depth->image->NativeHandle())};
+            const vk::Extent2D in{t.depth->info.size.width, t.depth->info.size.height};
+            Ctx().stream.cmd.Run([src, dst, in, size = xr_post.output, stencil = bool(t.depth->info.props.has_stencil)](vk::CommandBuffer cmd) {
+                for (u32 eye = 0; eye < 2; ++eye) {
+                    BlitXrLayer(cmd, src, in, eye, dst, size, eye, vk::ImageAspectFlagBits::eDepth, vk::Filter::eNearest);
+                    if (stencil)
+                        BlitXrLayer(cmd, src, in, eye, dst, size, eye, vk::ImageAspectFlagBits::eStencil, vk::Filter::eNearest);
+                }
+            });
+            GlobalBarrier();
+            xr_post.depth_copied = true;
+        }
+    }
+    // Use the exact SRV (including its eye layer and component mapping) that the guest bound.
+    if (target == xr_post.final && std::ranges::find(b.sampled, xr_post.resolved) != b.sampled.end()) {
+        bool remapped = false;
+        for (auto& image : b.images) {
+            std::optional<VideoCore::ImageViewInfo> info;
+            {
+                std::scoped_lock lock{views_mutex};
+                const auto it = views.find(xr_post.resolved);
+                if (it == views.end()) continue;
+                for (const auto& v : it->second) {
+                    if (v.use == ViewUse::Sampled && *v.view == image.imageView) {
+                        info = v.info;
+                        break;
+                    }
+                }
+            }
+            if (info) {
+                const auto hdr = View(*xr_post.hdr, *info, ViewUse::Sampled);
+                if (!hdr) return {};
+                image.imageView = hdr;
+                b.key_layout = nullptr;
+                remapped = true;
+            }
+        }
+        const auto range = t.color_ranges[0];
+        // GT7 binds 1+1 for the right and 0+2 for the left. Each draw writes the
+        // attachment's base layer. Require two distinct draws before showing either eye.
+        if (!remapped || !range.layers || range.layer + range.layers > 2)
+            return {};
+        if (!xr_post.toned_eyes)
+            GlobalBarrier();
+        xr_post.toned_eyes |= 1u << range.layer;
+    }
+    return state;
+}
+
+// Match the two-layer scene MRT, then its actual consumers in the stereo TAA pass.
+void NativeRenderer::NoteXrScene(const GraphicsPipeline& pipeline, const Targets& t, const DrawBindings& b) {
+    const auto* color = t.colors[0];
+    const auto* mv = t.colors[1];
+    const auto* depth = t.depth;
+    if (color && mv && depth && color->info.pixel_format == vk::Format::eB10G11R11UfloatPack32 &&
+        mv->info.pixel_format == vk::Format::eR16G16Sfloat && mv->image && depth->image &&
+        mv->image->Desc().layers == 2 && depth->image->Desc().layers == 2 &&
+        depth->info.num_samples == 1 && mv->info.num_samples == 1 &&
+        depth->info.size.width == mv->info.size.width && depth->info.size.height == mv->info.size.height &&
+        Gt7XrCamera::PackExtent(mv->info.size.width, mv->info.size.height) == Gt7XrCamera::game_eye_extent.load()) {
+        if (xr_scene.frame != frame || xr_scene.color != color ||
+            xr_scene.motion != mv || xr_scene.depth != depth)
+            xr_scene = {color, mv, depth, frame};
+        const u32 layer = t.color_ranges[1].layer;
+        if (layer < 2)
+            xr_scene.confirmed_eyes &= ~(1u << layer);
+        return;
+    }
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (xr_scene.frame != frame || !xr_scene.motion || !fs || fs->pgm_hash != XrStereoTaaShader ||
+        std::ranges::find(b.sampled, xr_scene.motion) == b.sampled.end() ||
+        std::ranges::find(b.sampled, xr_scene.color) == b.sampled.end())
+        return;
+    for (const auto& desc : fs->buffers) {
+        if (desc.IsSpecial()) continue;
+        const auto sharp = desc.GetSharp(*fs);
+        std::array<float, 24> c{};
+        if (!sharp.base_address || sharp.GetSize() < sizeof(c) ||
+            !Core::RytyMemory::GuardedCopy(c.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(sharp.base_address)), sizeof(c)))
+            continue;
+        const float w = xr_scene.motion->info.size.width, h = xr_scene.motion->info.size.height;
+        if (!std::isfinite(c[14]) || !std::isfinite(c[15]) || std::abs(c[14]) < 1 ||
+            std::abs(c[15]) < 1 || std::abs(c[14]) > w || std::abs(c[15]) > h)
+            continue;
+        if (!std::isfinite(c[20]) || !std::isfinite(c[21]) ||
+            std::abs(c[20]*c[14]) > 1 || std::abs(c[21]*c[15]) > 1) continue;
+        const u32 layer = t.color_ranges[1].layer;
+        if (layer >= 2 || !t.colors[1])
+            continue;
+        xr_scene.scale[layer] = {-c[14] / w, -c[15] / h, c[20], c[21]};
+        xr_scene.confirmed_eyes |= 1u << layer;
+        if (Gt7XrCamera::reconstruction_extent.load(std::memory_order_relaxed))
+            ReconstructXrScene(t);
+        break;
+    }
+}
+
 void NativeRenderer::NoteXrEyeCopy(const GraphicsPipeline& pipeline, const Targets& targets,
                                    const DrawBindings& b) {
     const auto* output = targets.colors[0];
@@ -19549,6 +19979,14 @@ void NativeRenderer::NoteXrEyeCopy(const GraphicsPipeline& pipeline, const Targe
         xr_copies = {output, source, source->info.guest_address, frame, source_version};
     }
     xr_copies.eyes[layer] = color;
+    if (xr_post.frame == frame && xr_post.final == source && xr_post.display &&
+        xr_post.toned_eyes == 3 && !xr_post.incomplete) {
+        if (xr_copies.reconstructed_image != xr_post.display) {
+            xr_copies.reconstructed_eyes = {};
+            xr_copies.reconstructed_image = xr_post.display;
+        }
+        xr_copies.reconstructed_eyes[layer] = View(*xr_post.display, view, ViewUse::Sampled);
+    }
     xr_copies.output_version = output->write_version.load();
 }
 
@@ -19564,6 +20002,11 @@ void NativeRenderer::GetXrEyeCopies(const Native::ImageEntry& output, Display& d
         display.xr_movie = xr_movie.target == source && xr_movie.frame == copy.frame &&
                            xr_movie.version == copy.source_version;
         display.xr_eyes = copy.eyes;
+        if (!display.xr_movie && copy.reconstructed_eyes[0] && copy.reconstructed_eyes[1]) {
+            // Both SRVs retain the flip shader's guest channel mapping and eye selection.
+            display.xr_eyes = copy.reconstructed_eyes;
+            display.temporal_images[Display::XrEyePicture] = copy.reconstructed_image;
+        }
         display.xr_eye_size = vk::Extent2D{source->info.size.width, source->info.size.height};
     }
 }
@@ -19901,6 +20344,13 @@ void NativeRenderer::CollectTemporalPictures(u64 completed) {
 
 void NativeRenderer::ClearTemporalPictures() {
     // The scheduler has finished and the presenter no longer records commands.
+#ifdef RYGT_OPENXR
+    xr_copies = {};
+    xr_post.hdr.reset();
+    xr_post.display.reset();
+    for (auto& [key, image] : xr_post.images) ReleaseTemporalPicture(image);
+    xr_post.images.clear();
+#endif
     for (auto& [address, layer] : hud_layers) {
         ReleaseTemporalPicture(layer.black);
         ReleaseTemporalPicture(layer.white);
