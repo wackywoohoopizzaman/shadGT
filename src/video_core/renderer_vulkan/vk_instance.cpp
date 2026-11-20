@@ -32,6 +32,9 @@
 #include "ryty_gpu/ryty_xess.h"
 #endif
 
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr.h"
+#endif
 #include <vk_mem_alloc.h>
 #ifdef _WIN32
 #include <windows.h> // FIX-SGT-016: GetModuleHandleW
@@ -190,8 +193,12 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
-    : instance{
-          CreateInstance(window.GetWindowInfo().type, enable_validation, enable_crash_diagnostic)},
+#ifdef RYGT_OPENXR
+    : headset{OpenXrOutput::Create()}, instance{CreateInstance(window.GetWindowInfo().type,
+          enable_validation, enable_crash_diagnostic, headset.get())},
+#else
+    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation, enable_crash_diagnostic)},
+#endif
       physical_devices{EnumeratePhysicalDevices(instance)} {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
@@ -199,6 +206,16 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
+
+#ifdef RYGT_OPENXR
+    if (headset && physical_device_index < 0) {
+        const auto gpu = headset->PreferredAdapter(*instance);
+        const auto it = std::ranges::find(physical_devices, gpu);
+        if (it != physical_devices.end() && gpu.getProperties().apiVersion >= TargetVulkanApiVersion) {
+            physical_device_index = static_cast<s32>(it - physical_devices.begin());
+        }
+    }
+#endif
 
     if (physical_device_index < 0) {
         std::vector<
@@ -275,6 +292,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
+#ifdef RYGT_OPENXR
+    headset.reset();
+#endif
     // Pipeline producers must already be stopped by the renderer. Ensure no
     // queue still executes these shared shader objects before destroying them.
     if (shader_object && device) std::ignore = device->waitIdle();
@@ -388,7 +408,7 @@ bool Instance::CreateDevice() {
     }
 
     // NEO-GTS-508: room for every extension asked for below (over 48 call sites).
-    boost::container::static_vector<const char*, 64> enabled_extensions;
+    std::vector<const char*> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -1022,6 +1042,12 @@ bool Instance::CreateDevice() {
         xess_mutable_descriptor |= added && name == VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME;
         return added;
     });
+#endif
+
+#ifdef RYGT_OPENXR
+    if (headset) {
+        headset->CheckAdapter(*instance, physical_device, available_extensions, enabled_extensions);
+    }
 #endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();

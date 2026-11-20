@@ -11,11 +11,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 
 namespace Vulkan {
 struct Frame;
+struct GameStereoFrame;
 }
 
 namespace Libraries::VideoOut {
@@ -99,7 +101,7 @@ public:
 
     u64 AntiLagInput();
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
-                    u64 anti_lag_frame = 0);
+                    u64 anti_lag_frame = 0, std::shared_ptr<const Vulkan::GameStereoFrame> xr_frame = {});
 
     /// PERF-111: with SHADGT_FPS_LOCK a game's submit-and-flip returns once the frames it
     /// submitted before are on screen, so it runs one frame ahead of the screen instead of as
@@ -129,7 +131,8 @@ private:
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                            Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame);
+                            Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame,
+                            const Vulkan::GameStereoFrame* xr_frame);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;

@@ -168,6 +168,9 @@ if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "
 endif()
 if (RYGT_BUILD_OPENXR)
     find_package(OpenXR CONFIG REQUIRED)
+    target_compile_definitions(ryty_gpu PRIVATE RYGT_OPENXR)
+    target_sources(ryty_gpu PRIVATE ryty_gpu/ryty_openxr.cpp ryty_gpu/openxr_system.cpp)
+    target_link_libraries(ryty_gpu PRIVATE OpenXR::openxr_loader)
     add_executable(rygt_openxr_info ryty_gpu/tools/openxr_info.cpp ryty_gpu/openxr_system.cpp)
     target_link_libraries(rygt_openxr_info PRIVATE Vulkan::Headers OpenXR::openxr_loader)
     add_executable(rygt_openxr_stereo_test EXCLUDE_FROM_ALL

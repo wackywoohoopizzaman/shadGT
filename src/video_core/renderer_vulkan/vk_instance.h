@@ -39,8 +39,13 @@ struct SharedShaderObjects {
 /// DIAG-243 (SHADGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
 void NoteDrawForFault(u64 pipeline_hash, u32 info);
 
+class OpenXrOutput;
+
 class Instance {
 public:
+#ifdef RYGT_OPENXR
+    OpenXrOutput* Headset() const { return headset.get(); }
+#endif
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
@@ -746,6 +751,9 @@ private:
     [[nodiscard]] vk::FormatFeatureFlags2 GetFormatFeatureFlags(vk::Format format) const;
 
 private:
+#ifdef RYGT_OPENXR
+    std::unique_ptr<OpenXrOutput> headset;
+#endif
     vk::UniqueInstance instance;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;

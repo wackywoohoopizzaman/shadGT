@@ -26,6 +26,9 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_ui_hires.h"
+#ifdef RYGT_OPENXR
+#include "ryty_gpu/ryty_openxr.h"
+#endif
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -900,6 +903,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+#ifdef RYGT_OPENXR
+    if (auto* headset = instance.Headset()) {
+        headset->Start(instance);
+    }
+#endif
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -1140,15 +1148,23 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+static bool IsHeadsetMirror(const Frame& frame) {
+#ifdef RYGT_OPENXR
+    return !frame.is_hdr && OpenXrOutput::IsRunning();
+#else
+    return false;
+#endif
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                               VAddr cpu_address) {
+                               VAddr cpu_address, const GameStereoFrame* xr_frame) {
     const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
 #ifndef NDEBUG
     rasterizer->FrameDumpFlip(); // NAT-116
 #endif
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
-        return PrepareNativeFrame(*native, attribute, cpu_address);
+        return PrepareNativeFrame(*native, attribute, cpu_address, xr_frame);
     }
 #endif
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
@@ -1197,7 +1213,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto& temporalDlss = rasterizer->GetTemporalDlss();
     temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
         Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
-    const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
+    const auto temporalView = IsHeadsetMirror(*frame) ? vk::ImageView{} : temporalDlss.PreparePresent(guestFrame, image, view_info.format);
     if (temporalView) temporalDlss.CopyFrameGenerationInputs(guestFrame, frame->framegen_scene);
 #endif
 
@@ -1249,14 +1265,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // PERF-084: the host passes record into the command buffer directly.
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
-    bool scaled = false;
+    const bool mirror = IsHeadsetMirror(*frame);
+    bool scaled = mirror;
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{}; // HDR-UI
     std::string upscaler; // FSR-204: for the window title
     const vk::Extent2D game_size = image_size;
 #ifdef RYTY_GPU
     float side_x0 = 0.0f, side_x1 = 1.0f; // WIDE-042
-    const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
+    const auto shown = mirror ? std::nullopt : UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
                                           {frame->width, frame->height}, view_info.format,
                                           image.GetImage(),
                                           vk::ImageLayout::eShaderReadOnlyOptimal);
@@ -1346,6 +1363,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_scheduler = &draw_scheduler;
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+#ifdef RYGT_OPENXR
+    if (auto* headset = instance.Headset()) {
+        headset->Present(draw_scheduler, *frame, nullptr, xr_frame);
+    }
+#endif
     return frame;
 }
 
@@ -1501,7 +1523,7 @@ PresenterTimes g_presenter_times;
 
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                                     VAddr cpu_address) {
+                                     VAddr cpu_address, const GameStereoFrame* xr_frame) {
     // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
@@ -1674,12 +1696,13 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     vk::ImageView image_view = display->view;
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
-    bool scaled = false;
+    const bool mirror = IsHeadsetMirror(*frame);
+    bool scaled = mirror;
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
     std::string upscaler = display->upscaler; // actual Native scene reconstruction
     const vk::Extent2D game_size = image_size;
-    if (display->output_view) {
+    if (!mirror && display->output_view) {
         image_view = display->output_view;
         image_size = display->output_size;
         ui_layer_view = display->ui_layer;
@@ -1858,6 +1881,11 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     frame->ready_scheduler = &draw_scheduler;
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+#ifdef RYGT_OPENXR
+    if (auto* headset = instance.Headset()) {
+        headset->Present(draw_scheduler, *frame, nullptr, xr_frame);
+    }
+#endif
     return frame;
 }
 #endif
@@ -1956,6 +1984,13 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     frame->ready_scheduler = &scheduler;
     SubmitInfo info{};
     scheduler.Flush(info);
+#ifdef RYGT_OPENXR
+    // Only the GPU thread drives the XR frame loop. It also delivers guest blank flips.
+    if (auto* headset = instance.Headset()) {
+        if (!present_thread)
+            headset->Present(scheduler, *frame);
+    }
+#endif
     return frame;
 }
 

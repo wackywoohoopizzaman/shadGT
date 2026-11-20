@@ -28,6 +28,7 @@ struct Liverpool;
 }
 
 namespace Vulkan {
+struct GameStereoFrame;
 
 #ifdef RYTY_GPU
 /// GT7-UW: a display buffer's address, for the native renderer (vk_rasterizer_native.cpp, which
@@ -125,14 +126,14 @@ public:
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                        VAddr cpu_address);
+                        VAddr cpu_address, const GameStereoFrame* xr_frame = nullptr);
 
     Frame* PrepareBlankFrame(bool present_thread, Frame* frame = nullptr);
 #ifdef RYTY_GPU
     /// NAT-100: PrepareFrame for native mode (the picture native mode drew there).
     Frame* PrepareNativeFrame(NativeRenderer& native,
                               const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                              VAddr cpu_address);
+                              VAddr cpu_address, const GameStereoFrame* xr_frame = nullptr);
 #endif
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true,
