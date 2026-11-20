@@ -38,6 +38,8 @@ RYGT_SWITCH_EXPORT extern const std::size_t RyGT_SwitchDescriptionCount;
 RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Shader objects & caches
 #ifdef RYGT_OPENXR
+    "RYGTSW1|SHADGT_OPENXR_MIRROR_EYE|choice|Frame pacing & present|left|left; right; both; off|Shows one eye or both eyes side by side on the desktop. Off suspends window presentation during an SDR OpenXR session.",
+    "RYGTSW1|SHADGT_OPENXR_MIRROR_FRAMING|choice|Frame pacing & present|full|full; fill; inset|Fits the full eye, fills the available desktop area, or crops inside the lens edges.",
     "RYGTSW1|SHADGT_OPENXR_REFLEX|choice|NVIDIA|auto|auto; off; on; boost|Paces the real cockpit frame producer with NVIDIA Reflex. Auto enables it with NVIDIA VR frame generation.",
     "RYGTSW1|SHARED_OPENXR_FRAMEGEN|choice|Frame pacing & present|off|0 = off; 1 = FidelityFX; dlss = NVIDIA DLSS-G|Generates intermediate stereo pairs between game frames in OpenXR.",
     "RYGTSW1|SHADGT_OPENXR_DLSS_MODEL|choice|NVIDIA|m|m; l; k; j; auto|Selects the VR DLSS reconstruction model for both eyes at every quality, including DLAA. Auto uses NVIDIA's per-quality defaults.",

@@ -35,9 +35,9 @@ struct PostProcessingConstants {
     float side_dim = 1.0f;
 };
 // Must match the push-constant block in post_process.frag.
-static_assert(sizeof(PostProcessingPass::Settings) == 56);
-static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 56);
-static_assert(sizeof(PostProcessingConstants) == 72);
+static_assert(sizeof(PostProcessingPass::Settings) == 72);
+static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 72);
+static_assert(sizeof(PostProcessingConstants) == 88);
 } // namespace
 
 void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_device) {
@@ -257,7 +257,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
                                 vk::ImageView ui_layer, bool dlss_scaled, float side_x0,
                                 float side_x1, vk::ImageView hud_black, vk::ImageView hud_white,
-                                std::span<const HudWidget> hud_widgets) {
+                                std::span<const HudWidget> hud_widgets, vk::ImageLayout input_layout,
+                                vk::Rect2D viewport, vk::Rect2D render_area) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -277,13 +278,10 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .storeOp = vk::AttachmentStoreOp::eStore,
         },
     }};
+    if (!render_area.extent.width || !render_area.extent.height)
+        render_area = vk::Rect2D{{0, 0}, {frame.width, frame.height}};
     const vk::RenderingInfo rendering_info{
-        .renderArea{
-            .extent{
-                .width = frame.width,
-                .height = frame.height,
-            },
-        },
+        .renderArea = render_area,
         .layerCount = 1,
         .colorAttachmentCount = attachments.size(),
         .pColorAttachments = attachments.data(),
@@ -292,7 +290,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     vk::DescriptorImageInfo image_info{
         .sampler = *sampler,
         .imageView = input,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = input_layout,
     };
     // GT7-UW: the HUD pictures stay in the general layout native mode keeps its pictures in;
     // without a HUD the input stands in (the shader does not read it then).
@@ -301,12 +299,12 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     const vk::DescriptorImageInfo hud_black_info{
         .sampler = *sampler,
         .imageView = hud ? hud_black : input,
-        .imageLayout = hud ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = hud ? vk::ImageLayout::eGeneral : input_layout,
     };
     const vk::DescriptorImageInfo hud_white_info{
         .sampler = *sampler,
         .imageView = hud ? hud_white : input,
-        .imageLayout = hud ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = hud ? vk::ImageLayout::eGeneral : input_layout,
     };
 
     // GT7-UW: the layout in this frame's slot of the buffer (a count, then the pieces).
@@ -330,7 +328,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     vk::DescriptorImageInfo ui_info{
         .sampler = *sampler,
         .imageView = ui_layer ? ui_layer : input,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = ui_layer ? vk::ImageLayout::eShaderReadOnlyOptimal : input_layout,
     };
     settings.ui_layer = ui_layer ? 1 : 0;
     const std::array set_writes{
@@ -387,7 +385,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     // WIDE-009: a 16:9 picture (the boot screens, shown before the high-resolution UI takes
     // over) on a wide window goes between black bars instead of being stretched over it.
     vk::Rect2D area{{0, 0}, {frame.width, frame.height}};
-    if (input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
+    if (!viewport.extent.width && input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
         const double input_aspect = double(input_size.width) / input_size.height;
         const double frame_aspect = double(frame.width) / frame.height;
         if (input_aspect < frame_aspect * 0.8) {
@@ -395,18 +393,21 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             area = vk::Rect2D{{s32((frame.width - width) / 2), 0}, {width, frame.height}};
         }
     }
+    if (!viewport.extent.width || !viewport.extent.height)
+        viewport = area;
     const std::array viewports = {
         vk::Viewport{
-            .x = static_cast<float>(area.offset.x),
-            .width = static_cast<float>(area.extent.width),
-            .height = static_cast<float>(frame.height),
+            .x = static_cast<float>(viewport.offset.x),
+            .y = static_cast<float>(viewport.offset.y),
+            .width = static_cast<float>(viewport.extent.width),
+            .height = static_cast<float>(viewport.extent.height),
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         },
     };
 
     cmdbuf.setViewport(0, viewports);
-    cmdbuf.setScissor(0, area);
+    cmdbuf.setScissor(0, viewport);
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
     float dlss_sharpening = 0.0f;
