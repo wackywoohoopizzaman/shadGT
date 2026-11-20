@@ -83,6 +83,7 @@ namespace Rhi {
 class Buffer;
 class Image;     // FIX-GT7-133
 class ImageView; // FIX-GT7-133
+class Sampler;
 class CommandList;
 class Device;
 class Pipeline;
@@ -98,6 +99,7 @@ class OneOffObserver;
 
 template <class Buffer> class AsyncMirrorBuffer;
 
+class XrEyeEffects;
 class Rasterizer;
 struct GtsSceneImage;
 class GraphicsPipeline;
@@ -430,14 +432,40 @@ private:
 
 #ifdef RYGT_OPENXR
     // The two final eye-copy draws must refer to the same, still-current image.
+    struct XrSceneInputs {
+        const Native::ImageEntry *color{}, *motion{}, *depth{};
+        u64 frame{};
+        std::array<std::array<float, 4>, 2> scale{};
+        u32 confirmed_eyes{};
+    } xr_scene;
     static constexpr u64 XrStereoTaaShader = 0x286680a7;
     vk::DescriptorBufferInfo XrTaaConstants(VAddr address, u64 alignment);
+    void NoteXrScene(const GraphicsPipeline&, const Targets&, const DrawBindings&);
+    struct XrPostProcessing {
+        u64 frame = ~u64{0}, last_scene = ~u64{0}, origin{};
+        u32 eyes_seen{}, toned_eyes{};
+        const Native::ImageEntry *resolved{}, *final{};
+        Native::ImageEntry *hdr{}, *display{};
+        vk::Extent2D output{};
+        bool depth_copied{}, incomplete{};
+        std::chrono::steady_clock::time_point last_time{};
+        // Game flip buffers have distinct backing images and may still be queued.
+        std::map<std::tuple<VAddr, u64, u32>, std::unique_ptr<Native::ImageEntry>> images;
+        std::map<std::pair<u64, u64>, std::unique_ptr<XrEyeEffects>> effects;
+    } xr_post;
+    Native::ImageEntry* XrPostImage(const Native::ImageEntry& like, vk::Extent2D size, VAddr key);
+    // Updated on command replay after both vendor evaluations have been recorded.
+    std::atomic<u64> xr_reconstructed_frame{~u64{0}};
+    bool UseXrCurrentSample(const GraphicsPipeline&, const Targets&, const DrawBindings&);
+    void ReconstructXrScene(const Targets& targets);
+    std::optional<RenderState> XrPostDraw(const GraphicsPipeline&, const Targets&,
+                                          const AmdGpu::Regs&, DrawBindings&);
     struct XrEyeCopies {
         const Native::ImageEntry* output{};
         const Native::ImageEntry* source{};
         VAddr source_address{};
         u64 frame{}, source_version{}, output_version{};
-        std::array<vk::ImageView, 2> eyes{};
+        std::array<vk::ImageView, 2> eyes{}, reconstructed_eyes{};
     } xr_copies;
     struct {
         const Native::ImageEntry* target{};
@@ -2099,6 +2127,11 @@ private:
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;
+#ifdef RYGT_OPENXR
+    std::unique_ptr<Native::Rhi::Image> xr_invalid_motion;
+    std::unique_ptr<Native::Rhi::ImageView> xr_invalid_motion_view;
+    std::unique_ptr<Native::Rhi::Sampler> xr_invalid_motion_sampler;
+#endif
     /// FIX-GT7-133: a 1x1 depth image at 1.0 that stands in for an empty T# sampled with a
     /// depth comparison (2D and 2D-array views), so that the sampler's border still applies.
     std::unique_ptr<Native::Rhi::Image> depth_stand_in;

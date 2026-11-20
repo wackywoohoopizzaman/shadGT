@@ -25,4 +25,20 @@ bool GenerateDlss(vk::CommandBuffer cmd, const XrEffectFrame& frame, unsigned ey
                   unsigned count, unsigned index);
 bool Dlss(vk::CommandBuffer cmd, const XrEffectFrame& frame, unsigned eye);
 } // namespace XrVendor
+class XrEyeEffects {
+  public:
+    enum class Stage { Scene };
+    XrEyeEffects(const Instance&, Stage);
+    ~XrEyeEffects();
+    struct Pair {
+        std::array<vk::Image, 2> reconstructed{}; // linear HDR in GENERAL layout
+    };
+    Pair Process(vk::CommandBuffer cmd, const OpenXrOutput::StereoImages& source,
+                 const OpenXrOutput::ViewFrame& cameras, vk::Extent2D input,
+                 const std::array<vk::Extent2D, 2>& output, int64_t source_interval_ns);
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
 } // namespace Vulkan

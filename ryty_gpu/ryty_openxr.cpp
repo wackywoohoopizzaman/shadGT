@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ryty_gpu/ryty_openxr.h"
 #include "ryty_gpu/ryty_openxr_camera.h"
+#include "ryty_gpu/ryty_upscale_quality.h"
 #include "ryty_gpu/openxr_system.h"
 
 #ifdef _WIN32
@@ -97,6 +98,7 @@ struct OpenXrOutput::State {
     vk::UniqueDescriptorSetLayout descriptors;
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
+    bool spatial_upscale{};
     std::atomic<bool> enabled{true};
     bool running{}, focused{}, seat_calibrated{}, hdr_reported{};
 #ifdef SHADGT_DIAGNOSTICS
@@ -113,6 +115,8 @@ struct OpenXrOutput::State {
         if (Gt7XrCamera::Requested()) {
             Gt7XrCamera::SetAllocationSize({});
             Gt7XrCamera::game_eye_extent = 0;
+            Gt7XrCamera::reconstruction_extent = 0;
+            Gt7XrCamera::dlss_material_mip_bias = 0;
             Gt7XrCamera::Publish({});
         }
         for (auto& eye : eyes) {
@@ -162,6 +166,9 @@ std::unique_ptr<OpenXrOutput> OpenXrOutput::Create() {
     if (!value || std::string_view{value} != "1")
         return {};
     auto s = std::make_unique<State>();
+    const char* upscale = std::getenv("SHADGT_OPENXR_UPSCALER");
+    s->spatial_upscale =
+        upscale && (std::string_view{upscale} == "fsr" || std::string_view{upscale} == "dlss");
     if (!s->Initialize())
         return {};
     return std::unique_ptr<OpenXrOutput>(new OpenXrOutput(std::move(s)));
@@ -320,7 +327,7 @@ bool OpenXrOutput::State::Bind(const Instance& graphics) {
         n != 2)
         return false;
     const char* output_setting = std::getenv("SHADGT_OPENXR_OUTPUT_PERCENT");
-    const bool use_output_size = output_setting != nullptr;
+    const bool use_output_size = output_setting || std::getenv("SHADGT_OPENXR_UPSCALE_QUALITY");
     const auto output_percent = EyePercent(output_setting, 100);
     const auto shared_size = [&](uint32_t percent) -> vk::Extent2D {
         const auto& l = configs[0];
@@ -368,8 +375,17 @@ bool OpenXrOutput::State::Bind(const Instance& graphics) {
     if (!MakePipeline())
         return false;
     if (Gt7XrCamera::Requested()) {
+        if (spatial_upscale)
+            Gt7XrCamera::reconstruction_extent =
+                Gt7XrCamera::PackExtent(output.width, output.height);
         if (use_output_size) {
-            Gt7XrCamera::SetAllocationSize(output);
+            const auto quality =
+                spatial_upscale ? RytyUpscale::VrQuality() : RytyUpscale::Quality::Native;
+            auto input = vk::Extent2D{RytyUpscale::VrInputDimension(output.width, quality),
+                                      RytyUpscale::VrInputDimension(output.height, quality)};
+            Gt7XrCamera::SetAllocationSize(input);
+            LOG_WARNING(Render_Vulkan, "OpenXR: {}% output {}x{} per eye, GT7 input {}x{}",
+                        output_percent, output.width, output.height, input.width, input.height);
         } else if (const auto percent =
                        EyePercent(std::getenv("SHADGT_OPENXR_RENDER_PERCENT"), 0)) {
             Gt7XrCamera::SetAllocationSize(shared_size(percent));

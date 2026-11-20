@@ -48,6 +48,10 @@ public:
         std::array<vk::ImageView, 2> colors;
         bool display_encoded;
         bool movie{};
+        std::array<vk::ImageView, 2> depth{}, motion{};
+        std::array<std::array<float, 4>, 2>
+            motion_scale{};        // each eye's velocity scale and jitter in motion units
+        vk::Extent2D color_size{}; // frame generation consumes the final composited color
     };
     // Called before camera-dependent work and paired with Present on the XR frame
     // owner. Repeated queries before the flip return the same predicted views.
