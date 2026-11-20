@@ -1,0 +1,21 @@
+{
+  "view_mode": "both",
+  "layout": "side_by_side",
+  "headset_profile": "quest3",
+  "render_width": 1280,
+  "render_height": 1400,
+  "asymmetric_fov": true,
+  "fov_degrees": 90,
+  "ipd_mm": 64,
+  "zoom_mode": "fill",
+  "zoom_scale": 1.000,
+  "window_width": 2304,
+  "window_height": 1232,
+  "full_render": false,
+  "show_stats": false,
+  "gpu_timing": true,
+  "move_speed": 3.00,
+  "move_boost": 4.00,
+  "input_polling": "app",
+  "preview_fps": 90
+}
