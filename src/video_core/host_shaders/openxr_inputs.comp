@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding=0) uniform sampler2D eyeColor;
+layout(binding=1) uniform sampler2D eyeDepth;
+layout(binding=2) uniform sampler2D eyeMotion;
+layout(binding=3, rgba16f) writeonly uniform image2D outColor;
+layout(binding=4, r32f) writeonly uniform image2D outDepth;
+layout(binding=5, rg16f) writeonly uniform image2D outMotion;
+layout(push_constant) uniform Motion { vec2 scale; vec2 jitter; } info;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(p, imageSize(outColor))))
+        imageStore(outColor, p, vec4(texelFetch(eyeColor, p, 0).rgb, 1));
+    if (any(greaterThanEqual(p, imageSize(outDepth)))) return;
+    vec2 mv = (texelFetch(eyeMotion, p, 0).rg + info.jitter) * info.scale;
+    // GT7 marks pixels without a velocity with a large negative half-float.
+    if (any(isnan(mv)) || any(isinf(mv)) || any(greaterThan(abs(mv), vec2(1)))) mv = vec2(0);
+    imageStore(outDepth, p, vec4(texelFetch(eyeDepth, p, 0).r));
+    imageStore(outMotion, p, vec4(mv, 0, 0));
+}

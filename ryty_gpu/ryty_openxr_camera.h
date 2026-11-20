@@ -28,6 +28,8 @@ inline std::mutex prediction_mutex;
 inline vk::Extent2D allocation_size{};
 // The title publishes the committed size once it has created all three flip slots.
 inline std::atomic<uint64_t> game_eye_extent{};
+inline std::atomic<uint64_t> reconstruction_extent{};
+inline std::atomic<float> dlss_material_mip_bias{};
 inline uint64_t PackExtent(uint32_t width, uint32_t height) {
     return (uint64_t{width} << 32) | height;
 }

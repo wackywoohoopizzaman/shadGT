@@ -42,6 +42,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHARED_OPENXR_FRAMEGEN|choice|Frame pacing & present|off|0 = off; 1 = FidelityFX; dlss = NVIDIA DLSS-G|Generates intermediate stereo pairs between game frames in OpenXR.",
     "RYGTSW1|SHADGT_OPENXR_DLSS_MODEL|choice|NVIDIA|m|m; l; k; j; auto|Selects the VR DLSS reconstruction model for both eyes at every quality, including DLAA. Auto uses NVIDIA's per-quality defaults.",
     "RYGTSW1|SHADGT_OPENXR_TAA|choice|Rendering workarounds|balanced|game; balanced; clear|Adjusts GT7 stereo anti-aliasing when the view is still. Clear preserves more fine detail and can increase shimmer. Game uses the original blend.",
+    "RYGTSW1|SHADGT_OPENXR_DLSS_TEXTURE_DETAIL|choice|NVIDIA|full|full; reduced; off|Adjusts mip levels for filtered material textures using the actual VR DLSS input and output widths. Reduced uses only the resolution ratio.",
     "RYGTSW1|SHADGT_OPENXR_UPSCALER|choice|Frame pacing & present|off|off; fsr; dlss|Upscales the two eye images to the OpenXR display size.",
     "RYGTSW1|SHADGT_OPENXR_OUTPUT_PERCENT|int|Frame pacing & present|100|25-100 = percent per axis|Sets the OpenXR eye swapchain size as a percentage of the headset runtime recommendation.",
     "RYGTSW1|SHADGT_OPENXR_UPSCALE_QUALITY|choice|Frame pacing & present|quality|native; quality; balanced; performance; ultra_performance|Sets the VR scene resolution relative to eye output and selects the reconstruction quality for VR.",

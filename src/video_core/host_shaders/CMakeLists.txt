@@ -53,6 +53,7 @@ add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 if (RYGT_BUILD_OPENXR)
     add_host_shader(openxr_eye.frag openxr_eye_frag)
+    add_host_shader(openxr_inputs.comp openxr_inputs_comp)
 endif()
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
