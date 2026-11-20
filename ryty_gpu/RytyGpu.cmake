@@ -170,6 +170,13 @@ if (RYGT_BUILD_OPENXR)
     find_package(OpenXR CONFIG REQUIRED)
     add_executable(rygt_openxr_info ryty_gpu/tools/openxr_info.cpp ryty_gpu/openxr_system.cpp)
     target_link_libraries(rygt_openxr_info PRIVATE Vulkan::Headers OpenXR::openxr_loader)
+    add_executable(rygt_openxr_stereo_test EXCLUDE_FROM_ALL
+        ryty_gpu/tests/openxr/stereo.cpp ryty_gpu/ryty_openxr.cpp ryty_gpu/openxr_system.cpp)
+    target_include_directories(rygt_openxr_stereo_test BEFORE PRIVATE
+        ${RYTY_GPU_DIR}/tests/openxr/support ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${HOST_SHADERS_INCLUDE})
+    target_link_libraries(rygt_openxr_stereo_test PRIVATE Vulkan::Headers OpenXR::openxr_loader)
+    add_dependencies(rygt_openxr_stereo_test host_shaders)
 endif()
 
 # RYTY_DIAG: this library holds the stutter diagnostics (ryty_diag.h), when the build has them.
