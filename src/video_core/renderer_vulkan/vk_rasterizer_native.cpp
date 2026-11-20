@@ -22820,9 +22820,13 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
         }
     }
     PrepareImages();
-    GlobalBarrier();
     const auto layers = std::min(src_desc.view_info.range.extent.layers,
                                  dst_desc.view_info.range.extent.layers);
+    // FIX-SGT-097: GT7 resolves each mirror eye separately. Mark only the destination slices
+    // actually written so resolving the right eye cannot supersede a newer left
+    // eye rendered through a one-layer alias of the same guest memory.
+    const DrawnRange dst_range{0, 1, dst_desc.view_info.range.base.layer, layers};
+    GlobalBarrier();
     const vk::ImageResolve region{
         .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
                         .mipLevel = 0,
@@ -22894,7 +22898,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
                 .pColorAttachments = &attachment,
             });
             s.cmd.endRendering();
-            Written(dst);
+            WrittenRange(dst, dst_range);
             s.buffers_written = true;
             ++s.commands;
             return;
@@ -22945,7 +22949,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
                     .renderArea{.extent = {region.extent.width, region.extent.height}},
                     .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &attachment});
                 s.cmd.endRendering();
-                Written(dst);
+                WrittenRange(dst, dst_range);
                 s.buffers_written = true;
                 ++s.commands;
                 return;
@@ -22975,7 +22979,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
                             vk::ImageLayout::eGeneral, copy);
             // RHI image destruction is deferred by the scheduler timeline.
             scratch.reset();
-            Written(dst);
+            WrittenRange(dst, dst_range);
             s.buffers_written = true;
             ++s.commands;
             return;
@@ -22991,7 +22995,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
         CmdBuf{s.cmd}.copyImage(src_image, vk::ImageLayout::eGeneral, dst_image,
                                 vk::ImageLayout::eGeneral, copy);
     }
-    Written(dst);
+    WrittenRange(dst, dst_range);
     s.buffers_written = true;
     ++s.commands;
 }
